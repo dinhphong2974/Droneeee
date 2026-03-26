@@ -15,11 +15,11 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QFont, QFontDatabase, QGradient, QIcon,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
-from PySide6.QtWidgets import (QApplication, QGridLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow,
-    QProgressBar, QPushButton, QSizePolicy, QSlider,
-    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget)
+from PySide6.QtWidgets import (QApplication, QFrame, QGridLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMainWindow, QProgressBar, QPushButton, QSizePolicy,
+    QSlider, QSpacerItem, QTabWidget, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget)
 
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
@@ -28,90 +28,115 @@ class Ui_MainWindow(object):
         MainWindow.resize(1200, 800)
         self.centralWidget = QWidget(MainWindow)
         self.centralWidget.setObjectName(u"centralWidget")
-        self.gridLayout_main = QGridLayout(self.centralWidget)
+        self.verticalLayout_main = QVBoxLayout(self.centralWidget)
+        self.verticalLayout_main.setObjectName(u"verticalLayout_main")
+        self.frame_topbar = QFrame(self.centralWidget)
+        self.frame_topbar.setObjectName(u"frame_topbar")
+        self.frame_topbar.setFrameShape(QFrame.StyledPanel)
+        self.frame_topbar.setFrameShadow(QFrame.Raised)
+        self.hLayout_topbar = QHBoxLayout(self.frame_topbar)
+        self.hLayout_topbar.setObjectName(u"hLayout_topbar")
+        self.hLayout_topbar.setContentsMargins(10, 5, 10, 5)
+        self.lbl_batt_volt = QLabel(self.frame_topbar)
+        self.lbl_batt_volt.setObjectName(u"lbl_batt_volt")
+        font = QFont()
+        font.setBold(True)
+        self.lbl_batt_volt.setFont(font)
+
+        self.hLayout_topbar.addWidget(self.lbl_batt_volt)
+
+        self.bar_battery_volt = QProgressBar(self.frame_topbar)
+        self.bar_battery_volt.setObjectName(u"bar_battery_volt")
+        self.bar_battery_volt.setMinimumSize(QSize(150, 20))
+        self.bar_battery_volt.setMaximumSize(QSize(200, 25))
+        self.bar_battery_volt.setValue(0)
+        self.bar_battery_volt.setTextVisible(False)
+
+        self.hLayout_topbar.addWidget(self.bar_battery_volt)
+
+        self.lbl_batt_perc = QLabel(self.frame_topbar)
+        self.lbl_batt_perc.setObjectName(u"lbl_batt_perc")
+        self.lbl_batt_perc.setFont(font)
+
+        self.hLayout_topbar.addWidget(self.lbl_batt_perc)
+
+        self.horizontalSpacer = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+        self.hLayout_topbar.addItem(self.horizontalSpacer)
+
+        self.lbl_wifi_status = QLabel(self.frame_topbar)
+        self.lbl_wifi_status.setObjectName(u"lbl_wifi_status")
+
+        self.hLayout_topbar.addWidget(self.lbl_wifi_status)
+
+        self.lbl_wifi_icon = QLabel(self.frame_topbar)
+        self.lbl_wifi_icon.setObjectName(u"lbl_wifi_icon")
+        self.lbl_wifi_icon.setFont(font)
+
+        self.hLayout_topbar.addWidget(self.lbl_wifi_icon)
+
+        self.horizontalSpacer_2 = QSpacerItem(20, 20, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+
+        self.hLayout_topbar.addItem(self.horizontalSpacer_2)
+
+        self.btn_disconnect = QPushButton(self.frame_topbar)
+        self.btn_disconnect.setObjectName(u"btn_disconnect")
+        self.btn_disconnect.setMinimumSize(QSize(120, 30))
+
+        self.hLayout_topbar.addWidget(self.btn_disconnect)
+
+
+        self.verticalLayout_main.addWidget(self.frame_topbar)
+
+        self.gridLayout_main = QGridLayout()
         self.gridLayout_main.setObjectName(u"gridLayout_main")
         self.grp_telemetry = QGroupBox(self.centralWidget)
         self.grp_telemetry.setObjectName(u"grp_telemetry")
         self.gridLayout_telemetry = QGridLayout(self.grp_telemetry)
         self.gridLayout_telemetry.setObjectName(u"gridLayout_telemetry")
-        self.lbl_batt_volt = QLabel(self.grp_telemetry)
-        self.lbl_batt_volt.setObjectName(u"lbl_batt_volt")
-
-        self.gridLayout_telemetry.addWidget(self.lbl_batt_volt, 0, 0, 1, 1)
-
-        self.bar_battery_volt = QProgressBar(self.grp_telemetry)
-        self.bar_battery_volt.setObjectName(u"bar_battery_volt")
-        self.bar_battery_volt.setValue(99)
-        self.bar_battery_volt.setMinimum(0)
-        self.bar_battery_volt.setMaximum(100)
-        self.bar_battery_volt.setTextVisible(False)
-
-        self.gridLayout_telemetry.addWidget(self.bar_battery_volt, 0, 1, 1, 1)
-
-        self.lbl_batt_perc = QLabel(self.grp_telemetry)
-        self.lbl_batt_perc.setObjectName(u"lbl_batt_perc")
-        font = QFont()
-        font.setBold(True)
-        self.lbl_batt_perc.setFont(font)
-
-        self.gridLayout_telemetry.addWidget(self.lbl_batt_perc, 0, 2, 1, 1)
-
-        self.lbl_wifi_status = QLabel(self.grp_telemetry)
-        self.lbl_wifi_status.setObjectName(u"lbl_wifi_status")
-
-        self.gridLayout_telemetry.addWidget(self.lbl_wifi_status, 0, 4, 1, 1)
-
-        self.lbl_wifi_icon = QLabel(self.grp_telemetry)
-        self.lbl_wifi_icon.setObjectName(u"lbl_wifi_icon")
-        font1 = QFont()
-        font1.setPointSize(12)
-        self.lbl_wifi_icon.setFont(font1)
-
-        self.gridLayout_telemetry.addWidget(self.lbl_wifi_icon, 0, 5, 1, 1)
-
         self.lbl_batt_curr = QLabel(self.grp_telemetry)
         self.lbl_batt_curr.setObjectName(u"lbl_batt_curr")
 
-        self.gridLayout_telemetry.addWidget(self.lbl_batt_curr, 1, 0, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.lbl_batt_curr, 0, 0, 1, 1)
 
         self.val_batt_curr = QLabel(self.grp_telemetry)
         self.val_batt_curr.setObjectName(u"val_batt_curr")
         self.val_batt_curr.setFont(font)
 
-        self.gridLayout_telemetry.addWidget(self.val_batt_curr, 1, 1, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.val_batt_curr, 0, 1, 1, 1)
 
         self.lbl_mode = QLabel(self.grp_telemetry)
         self.lbl_mode.setObjectName(u"lbl_mode")
 
-        self.gridLayout_telemetry.addWidget(self.lbl_mode, 2, 0, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.lbl_mode, 1, 0, 1, 1)
 
         self.val_mode = QLabel(self.grp_telemetry)
         self.val_mode.setObjectName(u"val_mode")
         self.val_mode.setFont(font)
 
-        self.gridLayout_telemetry.addWidget(self.val_mode, 2, 1, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.val_mode, 1, 1, 1, 1)
 
         self.lbl_armed = QLabel(self.grp_telemetry)
         self.lbl_armed.setObjectName(u"lbl_armed")
 
-        self.gridLayout_telemetry.addWidget(self.lbl_armed, 3, 0, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.lbl_armed, 2, 0, 1, 1)
 
         self.val_armed = QLabel(self.grp_telemetry)
         self.val_armed.setObjectName(u"val_armed")
         self.val_armed.setFont(font)
 
-        self.gridLayout_telemetry.addWidget(self.val_armed, 3, 1, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.val_armed, 2, 1, 1, 1)
 
         self.lbl_alt = QLabel(self.grp_telemetry)
         self.lbl_alt.setObjectName(u"lbl_alt")
 
-        self.gridLayout_telemetry.addWidget(self.lbl_alt, 4, 0, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.lbl_alt, 3, 0, 1, 1)
 
         self.val_alt = QLabel(self.grp_telemetry)
         self.val_alt.setObjectName(u"val_alt")
         self.val_alt.setFont(font)
 
-        self.gridLayout_telemetry.addWidget(self.val_alt, 4, 1, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.val_alt, 3, 1, 1, 1)
 
         self.grp_gps_coords = QGroupBox(self.grp_telemetry)
         self.grp_gps_coords.setObjectName(u"grp_gps_coords")
@@ -140,73 +165,73 @@ class Ui_MainWindow(object):
         self.gridLayout_gps_coords.addWidget(self.val_lon, 0, 3, 1, 1)
 
 
-        self.gridLayout_telemetry.addWidget(self.grp_gps_coords, 5, 0, 1, 2)
+        self.gridLayout_telemetry.addWidget(self.grp_gps_coords, 4, 0, 1, 2)
 
         self.lbl_roll = QLabel(self.grp_telemetry)
         self.lbl_roll.setObjectName(u"lbl_roll")
 
-        self.gridLayout_telemetry.addWidget(self.lbl_roll, 1, 4, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.lbl_roll, 0, 4, 1, 1)
 
         self.val_roll = QLabel(self.grp_telemetry)
         self.val_roll.setObjectName(u"val_roll")
         self.val_roll.setFont(font)
 
-        self.gridLayout_telemetry.addWidget(self.val_roll, 1, 5, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.val_roll, 0, 5, 1, 1)
 
         self.lbl_pitch = QLabel(self.grp_telemetry)
         self.lbl_pitch.setObjectName(u"lbl_pitch")
 
-        self.gridLayout_telemetry.addWidget(self.lbl_pitch, 2, 4, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.lbl_pitch, 1, 4, 1, 1)
 
         self.val_pitch = QLabel(self.grp_telemetry)
         self.val_pitch.setObjectName(u"val_pitch")
         self.val_pitch.setFont(font)
 
-        self.gridLayout_telemetry.addWidget(self.val_pitch, 2, 5, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.val_pitch, 1, 5, 1, 1)
 
         self.lbl_yaw = QLabel(self.grp_telemetry)
         self.lbl_yaw.setObjectName(u"lbl_yaw")
 
-        self.gridLayout_telemetry.addWidget(self.lbl_yaw, 3, 4, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.lbl_yaw, 2, 4, 1, 1)
 
         self.val_yaw = QLabel(self.grp_telemetry)
         self.val_yaw.setObjectName(u"val_yaw")
         self.val_yaw.setFont(font)
 
-        self.gridLayout_telemetry.addWidget(self.val_yaw, 3, 5, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.val_yaw, 2, 5, 1, 1)
 
         self.lbl_gps_fix = QLabel(self.grp_telemetry)
         self.lbl_gps_fix.setObjectName(u"lbl_gps_fix")
 
-        self.gridLayout_telemetry.addWidget(self.lbl_gps_fix, 4, 4, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.lbl_gps_fix, 3, 4, 1, 1)
 
         self.val_gps_fix = QLabel(self.grp_telemetry)
         self.val_gps_fix.setObjectName(u"val_gps_fix")
         self.val_gps_fix.setFont(font)
 
-        self.gridLayout_telemetry.addWidget(self.val_gps_fix, 4, 5, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.val_gps_fix, 3, 5, 1, 1)
 
         self.lbl_sats = QLabel(self.grp_telemetry)
         self.lbl_sats.setObjectName(u"lbl_sats")
 
-        self.gridLayout_telemetry.addWidget(self.lbl_sats, 5, 4, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.lbl_sats, 4, 4, 1, 1)
 
         self.val_sats = QLabel(self.grp_telemetry)
         self.val_sats.setObjectName(u"val_sats")
         self.val_sats.setFont(font)
 
-        self.gridLayout_telemetry.addWidget(self.val_sats, 5, 5, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.val_sats, 4, 5, 1, 1)
 
         self.lbl_spd = QLabel(self.grp_telemetry)
         self.lbl_spd.setObjectName(u"lbl_spd")
 
-        self.gridLayout_telemetry.addWidget(self.lbl_spd, 6, 4, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.lbl_spd, 5, 4, 1, 1)
 
         self.val_spd = QLabel(self.grp_telemetry)
         self.val_spd.setObjectName(u"val_spd")
         self.val_spd.setFont(font)
 
-        self.gridLayout_telemetry.addWidget(self.val_spd, 6, 5, 1, 1)
+        self.gridLayout_telemetry.addWidget(self.val_spd, 5, 5, 1, 1)
 
 
         self.gridLayout_main.addWidget(self.grp_telemetry, 0, 0, 1, 1)
@@ -390,7 +415,7 @@ class Ui_MainWindow(object):
         self.bar_motor1.setObjectName(u"bar_motor1")
         self.bar_motor1.setMinimum(1000)
         self.bar_motor1.setMaximum(2000)
-        self.bar_motor1.setValue(1271)
+        self.bar_motor1.setValue(1000)
         self.bar_motor1.setOrientation(Qt.Vertical)
         self.bar_motor1.setTextVisible(False)
 
@@ -418,7 +443,7 @@ class Ui_MainWindow(object):
         self.bar_motor2.setObjectName(u"bar_motor2")
         self.bar_motor2.setMinimum(1000)
         self.bar_motor2.setMaximum(2000)
-        self.bar_motor2.setValue(1263)
+        self.bar_motor2.setValue(1000)
         self.bar_motor2.setOrientation(Qt.Vertical)
         self.bar_motor2.setTextVisible(False)
 
@@ -446,7 +471,7 @@ class Ui_MainWindow(object):
         self.bar_motor3.setObjectName(u"bar_motor3")
         self.bar_motor3.setMinimum(1000)
         self.bar_motor3.setMaximum(2000)
-        self.bar_motor3.setValue(1262)
+        self.bar_motor3.setValue(1000)
         self.bar_motor3.setOrientation(Qt.Vertical)
         self.bar_motor3.setTextVisible(False)
 
@@ -474,7 +499,7 @@ class Ui_MainWindow(object):
         self.bar_motor4.setObjectName(u"bar_motor4")
         self.bar_motor4.setMinimum(1000)
         self.bar_motor4.setMaximum(2000)
-        self.bar_motor4.setValue(1269)
+        self.bar_motor4.setValue(1000)
         self.bar_motor4.setOrientation(Qt.Vertical)
         self.bar_motor4.setTextVisible(False)
 
@@ -596,6 +621,9 @@ class Ui_MainWindow(object):
 
         self.gridLayout_main.addWidget(self.tabWidget, 1, 1, 1, 1)
 
+
+        self.verticalLayout_main.addLayout(self.gridLayout_main)
+
         MainWindow.setCentralWidget(self.centralWidget)
 
         self.retranslateUi(MainWindow)
@@ -608,40 +636,39 @@ class Ui_MainWindow(object):
 
     def retranslateUi(self, MainWindow):
         MainWindow.setWindowTitle(QCoreApplication.translate("MainWindow", u"Drone Ground Control Station - INAV MSP", None))
+        self.lbl_batt_volt.setText(QCoreApplication.translate("MainWindow", u"-- V", None))
+        self.bar_battery_volt.setStyleSheet(QCoreApplication.translate("MainWindow", u"QProgressBar { border: 2px solid #8f8f91; border-radius: 5px; background-color: #e0e0e0; text-align: center; } QProgressBar::chunk { background-color: gray; border-radius: 3px; }", None))
+        self.lbl_batt_perc.setText(QCoreApplication.translate("MainWindow", u"-- %", None))
+        self.lbl_wifi_status.setText(QCoreApplication.translate("MainWindow", u"WiFi Status:", None))
+        self.lbl_wifi_icon.setText(QCoreApplication.translate("MainWindow", u"\U0001f4f6 \U00000110ang ch\U00001edd", None))
+        self.btn_disconnect.setText(QCoreApplication.translate("MainWindow", u"Ng\u1eaft k\u1ebft n\u1ed1i", None))
+        self.btn_disconnect.setStyleSheet(QCoreApplication.translate("MainWindow", u"QPushButton { background-color: #F44336; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #D32F2F; }", None))
         self.grp_telemetry.setTitle(QCoreApplication.translate("MainWindow", u"Telemetry Dashboard", None))
-        self.lbl_batt_volt.setText(QCoreApplication.translate("MainWindow", u"Battery Status", None))
-        self.bar_battery_volt.setStyleSheet(QCoreApplication.translate("MainWindow", u"QProgressBar { border: 2px solid #8f8f91; border-radius: 5px; background-color: #e0e0e0; height: 25px; text-align: center; } QProgressBar::chunk { background-color: #4CAF50; border-radius: 3px; }", None))
-        self.lbl_batt_perc.setText(QCoreApplication.translate("MainWindow", u"99.9 %", None))
-        self.lbl_wifi_status.setText(QCoreApplication.translate("MainWindow", u"WiFi Status", None))
-        self.lbl_wifi_icon.setText(QCoreApplication.translate("MainWindow", u"\U0001f4f6 100%", None))
-        self.lbl_wifi_icon.setStyleSheet(QCoreApplication.translate("MainWindow", u"color: #4CAF50;", None))
         self.lbl_batt_curr.setText(QCoreApplication.translate("MainWindow", u"Battery Current", None))
-        self.val_batt_curr.setText(QCoreApplication.translate("MainWindow", u"10.68 A", None))
+        self.val_batt_curr.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.lbl_mode.setText(QCoreApplication.translate("MainWindow", u"Mode", None))
-        self.val_mode.setText(QCoreApplication.translate("MainWindow", u"POSHOLD", None))
+        self.val_mode.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.lbl_armed.setText(QCoreApplication.translate("MainWindow", u"Armed", None))
-        self.val_armed.setText(QCoreApplication.translate("MainWindow", u"YES", None))
-        self.val_armed.setStyleSheet(QCoreApplication.translate("MainWindow", u"color: red;", None))
+        self.val_armed.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.lbl_alt.setText(QCoreApplication.translate("MainWindow", u"Altitude", None))
-        self.val_alt.setText(QCoreApplication.translate("MainWindow", u"10.25 m", None))
+        self.val_alt.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.grp_gps_coords.setTitle(QCoreApplication.translate("MainWindow", u"GPS Coordinates", None))
         self.lbl_lat.setText(QCoreApplication.translate("MainWindow", u"Latitude", None))
-        self.val_lat.setText(QCoreApplication.translate("MainWindow", u"21.028504", None))
+        self.val_lat.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.lbl_lon.setText(QCoreApplication.translate("MainWindow", u"Longitude", None))
-        self.val_lon.setText(QCoreApplication.translate("MainWindow", u"105.854300", None))
+        self.val_lon.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.lbl_roll.setText(QCoreApplication.translate("MainWindow", u"Roll", None))
-        self.val_roll.setText(QCoreApplication.translate("MainWindow", u"5.49\u00b0", None))
+        self.val_roll.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.lbl_pitch.setText(QCoreApplication.translate("MainWindow", u"Pitch", None))
-        self.val_pitch.setText(QCoreApplication.translate("MainWindow", u"4.80\u00b0", None))
+        self.val_pitch.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.lbl_yaw.setText(QCoreApplication.translate("MainWindow", u"Yaw", None))
-        self.val_yaw.setText(QCoreApplication.translate("MainWindow", u"15.45\u00b0", None))
+        self.val_yaw.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.lbl_gps_fix.setText(QCoreApplication.translate("MainWindow", u"GPS Fix", None))
-        self.val_gps_fix.setText(QCoreApplication.translate("MainWindow", u"3D FIX", None))
-        self.val_gps_fix.setStyleSheet(QCoreApplication.translate("MainWindow", u"color: #4CAF50;", None))
+        self.val_gps_fix.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.lbl_sats.setText(QCoreApplication.translate("MainWindow", u"Satellites", None))
-        self.val_sats.setText(QCoreApplication.translate("MainWindow", u"11", None))
+        self.val_sats.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.lbl_spd.setText(QCoreApplication.translate("MainWindow", u"Ground Speed", None))
-        self.val_spd.setText(QCoreApplication.translate("MainWindow", u"2.22 m/s", None))
+        self.val_spd.setText(QCoreApplication.translate("MainWindow", u"N/A", None))
         self.grp_manual_control.setTitle(QCoreApplication.translate("MainWindow", u"Manual Control", None))
         self.lbl_throttle.setText(QCoreApplication.translate("MainWindow", u"Throttle", None))
         self.val_throttle.setText(QCoreApplication.translate("MainWindow", u"1000", None))
@@ -663,16 +690,16 @@ class Ui_MainWindow(object):
         self.btn_start_mission_main.setText(QCoreApplication.translate("MainWindow", u"Start Mission", None))
         self.grp_motors.setTitle(QCoreApplication.translate("MainWindow", u"Motors", None))
         self.lbl_motor1.setText(QCoreApplication.translate("MainWindow", u"Motor 1", None))
-        self.val_motor1.setText(QCoreApplication.translate("MainWindow", u"1271", None))
+        self.val_motor1.setText(QCoreApplication.translate("MainWindow", u"1000", None))
         self.bar_motor1.setStyleSheet(QCoreApplication.translate("MainWindow", u"QProgressBar::chunk { background-color: #4CAF50; }", None))
         self.lbl_motor2.setText(QCoreApplication.translate("MainWindow", u"Motor 2", None))
-        self.val_motor2.setText(QCoreApplication.translate("MainWindow", u"1263", None))
+        self.val_motor2.setText(QCoreApplication.translate("MainWindow", u"1000", None))
         self.bar_motor2.setStyleSheet(QCoreApplication.translate("MainWindow", u"QProgressBar::chunk { background-color: #4CAF50; }", None))
         self.lbl_motor3.setText(QCoreApplication.translate("MainWindow", u"Motor 3", None))
-        self.val_motor3.setText(QCoreApplication.translate("MainWindow", u"1262", None))
+        self.val_motor3.setText(QCoreApplication.translate("MainWindow", u"1000", None))
         self.bar_motor3.setStyleSheet(QCoreApplication.translate("MainWindow", u"QProgressBar::chunk { background-color: #4CAF50; }", None))
         self.lbl_motor4.setText(QCoreApplication.translate("MainWindow", u"Motor 4", None))
-        self.val_motor4.setText(QCoreApplication.translate("MainWindow", u"1269", None))
+        self.val_motor4.setText(QCoreApplication.translate("MainWindow", u"1000", None))
         self.bar_motor4.setStyleSheet(QCoreApplication.translate("MainWindow", u"QProgressBar::chunk { background-color: #4CAF50; }", None))
         self.grp_waypoint_input.setTitle(QCoreApplication.translate("MainWindow", u"Waypoint Input", None))
         self.lbl_wp_lat.setText(QCoreApplication.translate("MainWindow", u"Latitude", None))

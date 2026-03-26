@@ -6,7 +6,7 @@ from ui.gcs_dashboard import Ui_MainWindow
 from comm.wifi_worker import WifiWorker
 
 class ConnectionDialog(QDialog):
-    """Cửa sổ kết nối mạng Wifi tới ESP32"""
+    """Cửa sổ cấu hình mạng Wifi tới ESP32"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Kết nối ESP32 - Wifi")
@@ -23,7 +23,7 @@ class ConnectionDialog(QDialog):
         # Nhập IP của ESP32
         h_ip = QHBoxLayout()
         h_ip.addWidget(QLabel("IP ESP32:"))
-        self.input_ip = QLineEdit("192.168.4.1") # Gợi ý sẵn IP phổ biến của ESP32 AP
+        self.input_ip = QLineEdit("192.168.4.1") # IP mặc định của ESP32 AP
         h_ip.addWidget(self.input_ip)
         layout.addLayout(h_ip)
         
@@ -67,12 +67,32 @@ class GCSApp(QMainWindow):
         super().__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+
+        # Gắn sự kiện cho nút kết nối/ngắt kết nối ở Top Bar
+        self.ui.btn_disconnect.clicked.connect(self.toggle_connection)
         
         self.worker = None
-        self.set_ui_state_na() # Mặc định làm mờ tất cả khi chưa có mạng
+        
+        # Khởi động ứng dụng ở trạng thái chưa có mạng (làm mờ giao diện)
+        self.set_ui_state_na() 
+
+    def toggle_connection(self):
+        """Xử lý nút bấm Top Bar: Mở bảng kết nối hoặc ngắt kết nối an toàn"""
+        if self.worker is not None:
+            # 1. Nếu đang có kết nối -> Hành động là NGẮT KẾT NỐI
+            self.worker.stop()
+            self.worker = None
+            self.set_ui_state_na()
+            self.setWindowTitle("Drone Ground Station - Đã ngắt kết nối")
+            QMessageBox.information(self, "Thông báo", "Đã ngắt kết nối với thiết bị an toàn.")
+        else:
+            # 2. Nếu chưa có kết nối -> Hành động là KẾT NỐI
+            dialog = ConnectionDialog(self)
+            if dialog.exec() == QDialog.Accepted:
+                self.start_connection(dialog.selected_ip, dialog.selected_port, dialog.is_mock_selected)
 
     def set_ui_state_na(self):
-        """Làm mờ/Khóa giao diện khi chưa lấy được data"""
+        """Trạng thái mất mạng: Khóa giao diện và chuyển nút thành KẾT NỐI"""
         labels_to_na = [
             self.ui.val_batt_curr, self.ui.val_mode, self.ui.val_armed, self.ui.val_alt,
             self.ui.val_lat, self.ui.val_lon, self.ui.val_roll, self.ui.val_pitch,
@@ -83,24 +103,42 @@ class GCSApp(QMainWindow):
             lbl.setText("N/A")
             lbl.setStyleSheet("color: gray;")
             
+        # Reset Top Bar (Pin & Wifi)
         self.ui.lbl_batt_volt.setText("-- V")
         self.ui.lbl_batt_perc.setText("-- %")
         self.ui.bar_battery_volt.setValue(0)
-        self.ui.lbl_wifi_icon.setText("📶 Mất mạng")
+        
+        self.ui.lbl_wifi_icon.setText("📶 Mất kết nối")
         self.ui.lbl_wifi_icon.setStyleSheet("color: gray;")
         
-        # Khóa vùng ghi dữ liệu để tránh gửi lệnh sai khi mất sóng
+        # Biến nút thành nút "Kết nối" (Màu xanh)
+        self.ui.btn_disconnect.setText("Kết nối")
+        self.ui.btn_disconnect.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #45a049; }"
+        )
+        
+        # Khóa vùng điều khiển để tránh gửi lệnh rớt mạng
         self.ui.grp_manual_control.setEnabled(False)
         self.ui.tab_mission.setEnabled(False)
 
     def enable_ui_components(self):
-        """Mở khóa giao diện khi mạng ổn định"""
+        """Trạng thái có mạng: Mở khóa giao diện và chuyển nút thành NGẮT KẾT NỐI"""
         self.ui.grp_manual_control.setEnabled(True)
         self.ui.tab_mission.setEnabled(True)
         self.ui.val_armed.setStyleSheet("color: red;")
         self.ui.val_gps_fix.setStyleSheet("color: #4CAF50;")
+        
+        # Cập nhật trạng thái WiFi
         self.ui.lbl_wifi_icon.setText("📶 Đã kết nối")
         self.ui.lbl_wifi_icon.setStyleSheet("color: #4CAF50;")
+        
+        # Biến nút thành nút "Ngắt kết nối" (Màu đỏ)
+        self.ui.btn_disconnect.setText("Ngắt kết nối")
+        self.ui.btn_disconnect.setStyleSheet(
+            "QPushButton { background-color: #F44336; color: white; font-weight: bold; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #D32F2F; }"
+        )
 
     def start_connection(self, ip, port, is_mock):
         """Kích hoạt luồng Wifi chạy ngầm"""
@@ -110,19 +148,25 @@ class GCSApp(QMainWindow):
         self.worker.start()
 
     def handle_connection_status(self, success, message):
+        """Xử lý tín hiệu trạng thái mạng từ luồng WifiWorker"""
         if success:
             self.setWindowTitle(f"Drone Ground Station - {message}")
             self.enable_ui_components()
         else:
-            QMessageBox.critical(self, "Lỗi Mạng", message)
+            # Chạy vào đây khi kết nối thất bại HOẶC bị đứt gánh giữa chừng
+            self.worker = None 
             self.set_ui_state_na()
+            self.setWindowTitle("Drone Ground Station - Mất kết nối")
+            QMessageBox.warning(self, "Cảnh báo Mạng", message)
 
     def update_telemetry_ui(self, data):
-        """Vẽ dữ liệu nhận được lên giao diện mượt mà nhất"""
+        """Cập nhật dữ liệu từ mạch FC lên giao diện"""
         if "voltage" in data:
             v = data["voltage"]
+            # Quy đổi điện áp Lipo 6S (19.8V rỗng - 25.2V đầy)
             percent = int(((v - 19.8) / (25.2 - 19.8)) * 100)
             percent = max(0, min(100, percent))
+            
             self.ui.lbl_batt_volt.setText(f"{v:.2f} V")
             self.ui.lbl_batt_perc.setText(f"{percent} %")
             self.ui.bar_battery_volt.setValue(percent)
@@ -145,6 +189,7 @@ class GCSApp(QMainWindow):
             self.ui.bar_motor4.setValue(data["motor4"])
 
     def closeEvent(self, event):
+        """Đảm bảo ngắt kết nối an toàn khi người dùng bấm dấu X tắt app"""
         if self.worker:
             self.worker.stop()
         event.accept()
@@ -152,9 +197,13 @@ class GCSApp(QMainWindow):
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     
-    dialog = ConnectionDialog()
+    # 1. Khởi chạy màn hình chính trước
+    window = GCSApp()
+    window.show()
+    
+    # 2. Tự động bật hộp thoại kết nối để tiện lợi
+    dialog = ConnectionDialog(window)
     if dialog.exec() == QDialog.Accepted:
-        window = GCSApp()
         window.start_connection(dialog.selected_ip, dialog.selected_port, dialog.is_mock_selected)
-        window.show()
-        sys.exit(app.exec())
+        
+    sys.exit(app.exec())

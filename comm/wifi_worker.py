@@ -1,90 +1,121 @@
-import time
 import socket
+import time
+import random
 from PySide6.QtCore import QThread, Signal
 
 class WifiWorker(QThread):
-    # Tín hiệu gửi từ luồng phụ (mạng) lên luồng chính (giao diện)
-    connection_status = Signal(bool, str) # True/False, Lời nhắn
-    telemetry_data = Signal(dict)         # Gói dữ liệu MSP đã giải mã
-    
+    # Định nghĩa các "đường dây tín hiệu" để gửi báo cáo về main.py
+    connection_status = Signal(bool, str) # Trạng thái mạng: (Thành công/Thất bại, Lời nhắn)
+    telemetry_data = Signal(dict)         # Dữ liệu giải mã gửi lên UI hiển thị
+
     def __init__(self, ip="192.168.4.1", port=8080, is_mock=False):
         super().__init__()
         self.ip = ip
         self.port = int(port)
         self.is_mock = is_mock
+        
         self.is_running = True
         self.sock = None
 
     def run(self):
-        """Khởi chạy luồng ngầm"""
+        """Hàm này tự động chạy trên một luồng (thread) riêng biệt khi gọi self.start()"""
         if self.is_mock:
             self._run_mock_mode()
         else:
-            self._run_wifi_tcp()
+            self._run_real_mode()
 
-    def _run_wifi_tcp(self):
-        """Kết nối TCP Socket tới module ESP32"""
+    def _run_real_mode(self):
+        """Chế độ kết nối thật tới ESP32 (Cho phép FC chưa kết nối)"""
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(0.2) # Set timeout ngắn lại để luồng chạy mượt hơn
+        
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(3.0) # Chờ tối đa 3s để kết nối ban đầu
             self.sock.connect((self.ip, self.port))
+            self.connection_status.emit(True, f"Đã kết nối Wifi với {self.ip}")
             
-            # Nếu qua được dòng trên là đã kết nối thành công
-            self.connection_status.emit(True, f"Đã kết nối ESP32 tại {self.ip}:{self.port}")
-            self.sock.settimeout(0.1) # Giảm timeout xuống cực thấp để vòng lặp đọc không bị nghẽn
+            # Lệnh giả để nuôi Watchdog ESP32
+            msp_keep_alive_ping = b'$M<\x00\x6e\x6e'
             
             while self.is_running:
                 try:
-                    # Lắng nghe dữ liệu MSP truyền từ FC -> ESP32 -> PC
-                    raw_data = self.sock.recv(1024)
+                    # 1. GỬI NHỊP TIM: Gửi liên tục để ESP32 không đá PC
+                    self.sock.sendall(msp_keep_alive_ping)
                     
-                    if raw_data:
-                        # TẠI ĐÂY SẼ LÀ HÀM GIẢI MÃ MSP (Sẽ viết ở bước sau)
-                        # parsed_data = parse_msp(raw_data)
-                        
-                        # Tạm thời phát tín hiệu rỗng
-                        parsed_data = {} 
-                        if parsed_data:
-                            self.telemetry_data.emit(parsed_data)
-                            
+                    # 2. CHỜ NHẬN DỮ LIỆU TỪ FC
+                    data = self.sock.recv(1024) 
+                    
+                    if not data:
+                        raise ConnectionAbortedError("ESP32 chủ động đóng kết nối TCP.")
+                    
+                    # Nếu có FC cắm vào, nó sẽ in ra dòng này
+                    print(f"Dữ liệu từ FC: {data}") 
+                    
                 except socket.timeout:
-                    # Chuyện bình thường khi mạch FC chưa kịp gửi dữ liệu mới
-                    pass
-                except Exception as e:
-                    self.connection_status.emit(False, f"Mất tín hiệu mạng: {str(e)}")
-                    break # Thoát vòng lặp nếu rớt mạng
-                
-                time.sleep(0.01) # Nhường CPU cho các tác vụ khác
-                
+                    # NẾU CHƯA CẮM FC NÓ SẼ NHẢY VÀO ĐÂY
+                    # Thay vì ngắt kết nối, ta chỉ bỏ qua (pass) để vòng lặp tiếp tục gửi nhịp tim
+                    print("Kết nối ESP32 ổn định. Đang chờ cắm mạch FC...")
+                    pass 
+                    
+                # Nghỉ 0.1s (10Hz)
+                time.sleep(0.1)
+                    
+        except ConnectionRefusedError:
+            self.connection_status.emit(False, "ESP32 từ chối kết nối (Sai IP/Port).")
         except Exception as e:
-            self.connection_status.emit(False, f"Không thể kết nối Wifi: {str(e)}")
+            self.connection_status.emit(False, f"Mất kết nối: {str(e)}")
         finally:
-            self.is_running = False
-            if self.sock:
-                self.sock.close()
+            self._close_socket()
 
     def _run_mock_mode(self):
-        """Chế độ mô phỏng Test Giao Diện"""
-        self.connection_status.emit(True, "Đang chạy chế độ Mock Test 🧪")
-        voltage = 25.2 # Pin 6S đầy
-        motor_base = 1270
+        """Chế độ giả lập để test UI mượt mà không cần cắm phần cứng"""
+        self.connection_status.emit(True, "Đang chạy chế độ Mock Test (Giả lập)")
+        
+        # Thông số gốc giả lập
+        mock_volt = 25.2
+        mock_pitch = 0.0
         
         while self.is_running:
-            voltage -= 0.05
-            if voltage < 19.8: voltage = 19.8
+            # Giả lập pin tụt dần
+            mock_volt -= random.uniform(0.001, 0.01)
+            if mock_volt < 19.5:
+                mock_volt = 25.2
                 
-            mock_data = {
-                "voltage": voltage,
-                "current": 10.5,
-                "pitch": 5.0, "roll": -2.1, "yaw": 15.0,
-                "motor1": motor_base + 1, "motor2": motor_base - 5,
-                "motor3": motor_base - 8, "motor4": motor_base + 2,
-                "gps_fix": "3D FIX", "sats": 12, "alt": 15.5
+            # Giả lập dao động góc nghiêng
+            mock_pitch += random.uniform(-1.0, 1.0)
+            if mock_pitch > 30: mock_pitch = 30
+            elif mock_pitch < -30: mock_pitch = -30
+
+            # Giả lập vòng tua động cơ
+            motor_base = random.randint(1100, 1500)
+
+            # Đóng gói dữ liệu giả và gửi lên UI
+            fake_data = {
+                "voltage": mock_volt,
+                "pitch": mock_pitch,
+                "roll": random.uniform(-5.0, 5.0),
+                "yaw": random.uniform(0, 360),
+                "motor1": motor_base + random.randint(-20, 20),
+                "motor2": motor_base + random.randint(-20, 20),
+                "motor3": motor_base + random.randint(-20, 20),
+                "motor4": motor_base + random.randint(-20, 20),
             }
-            self.telemetry_data.emit(mock_data)
-            time.sleep(0.1) # Giả lập tần số 10Hz
+            self.telemetry_data.emit(fake_data)
+            
+            # Tốc độ cập nhật UI (20Hz = 50ms/lần)
+            time.sleep(0.05) 
+            
+        self.connection_status.emit(False, "Đã dừng Mock Test")
+
+    def _close_socket(self):
+        """Đóng kết nối socket an toàn"""
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
 
     def stop(self):
-        """Dừng luồng an toàn khi đóng ứng dụng"""
+        """Hàm được gọi từ main.py khi người dùng bấm nút Ngắt Kết Nối"""
         self.is_running = False
-        self.wait()
+        self._close_socket()
