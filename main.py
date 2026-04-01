@@ -6,21 +6,18 @@ File này CHỈ đóng vai trò:
 2. Kết nối Signal/Slot giữa các module (WifiWorker ↔ UI)
 3. Quản lý vòng đời ứng dụng (mở/đóng kết nối)
 
-KHÔNG chứa logic: kết nối socket, giải mã giao thức, hay xử lý dữ liệu thô.
-
 Kiến trúc module:
     main.py → khởi tạo + điều phối Signal/Slot
-    ui/main_window.py → cửa sổ chính (Top Bar + Tab Widget)
-    ui/dashboard_tab.py → tab giám sát (Telemetry + Motors + Manual)
-    ui/mission_tab.py → tab lộ trình bay
-    ui/config_tab.py → tab cấu hình
+    ui/main_window.py → cửa sổ chính (Nav Rail + Stacked Pages)
+    ui/dashboard_tab.py → trang Attitude 3D + Telemetry + Motors
+    ui/manual_control_tab.py → trang điều khiển thủ công
+    ui/mission_tab.py → trang lộ trình bay
+    ui/config_tab.py → trang cấu hình
     comm/wifi_client.py → kết nối TCP thô
     comm/wifi_worker.py → QThread chạy ngầm
     comm/msp_parser.py → giải mã giao thức MSP
-
-Thông số phần cứng:
-    Pin: Lipo 6S (19.8V rỗng → 25.2V đầy)
-    Động cơ: 1960kv
+    core/drone_state.py → trạng thái drone chia sẻ
+    core/flight_controller.py → state machine bay tự động
 """
 
 import sys
@@ -28,6 +25,8 @@ from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout,
                                 QHBoxLayout, QLineEdit, QPushButton, QLabel, QMessageBox)
 from ui.main_window import MainWindow
 from comm.wifi_worker import WifiWorker
+from core.drone_state import DroneState
+from core.flight_controller import FlightController
 
 # ── Thông số pin Lipo 6S ──
 LIPO_6S_MIN_VOLTAGE = 19.8  # Điện áp rỗng (V)
@@ -114,6 +113,22 @@ class GCSApp(MainWindow):
 
         self.worker: WifiWorker | None = None
 
+        # ── Trạng thái drone chia sẻ ──
+        self.drone_state = DroneState()
+
+        # ── Flight Controller (state machine bay tự động) ──
+        self.flight_controller = FlightController(self.drone_state, parent=self)
+        self.flight_controller.status_update.connect(self._on_flight_status)
+        self.flight_controller.takeoff_complete.connect(self._on_takeoff_complete)
+        self.flight_controller.error_occurred.connect(self._on_flight_error)
+        self.flight_controller.state_changed.connect(self._on_flight_state_changed)
+
+        # ── Kết nối nút điều khiển bay (từ ManualControlTab) ──
+        mc = self.manual_control_tab
+        mc.btn_arm.clicked.connect(self.flight_controller.arm)
+        mc.btn_disarm.clicked.connect(self.flight_controller.disarm)
+        mc.btn_takeoff_hold.clicked.connect(self._confirm_takeoff)
+
         # Khởi chạy ở trạng thái chưa có mạng
         self.set_ui_state_na()
 
@@ -125,8 +140,11 @@ class GCSApp(MainWindow):
         """Xử lý nút bấm Top Bar: Mở bảng kết nối hoặc ngắt kết nối an toàn."""
         if self.worker is not None:
             # Đang có kết nối → NGẮT KẾT NỐI
+            self.flight_controller.abort()  # Dừng bay tự động nếu đang chạy
+            self.flight_controller.set_worker(None)
             self.worker.stop()
             self.worker = None
+            self.drone_state.reset()
             self.set_ui_state_na()
             self.setWindowTitle("Drone Ground Station - Đã ngắt kết nối")
             QMessageBox.information(self, "Thông báo", "Đã ngắt kết nối với thiết bị an toàn.")
@@ -150,6 +168,9 @@ class GCSApp(MainWindow):
         self.worker.connection_status.connect(self.handle_connection_status)
         self.worker.telemetry_data.connect(self.update_telemetry_ui)
 
+        # Cấp worker cho FlightController để gửi lệnh
+        self.flight_controller.set_worker(self.worker)
+
         # Khởi chạy thread ngầm
         self.worker.start()
 
@@ -167,10 +188,14 @@ class GCSApp(MainWindow):
         """
         if success:
             self.setWindowTitle(f"Drone Ground Station - {message}")
+            self.drone_state.is_connected = True
             self.enable_ui_components()
         else:
-            # Kết nối thất bại HOẶC bị đứt gánh giữa chừng
+            # Kết nối thất bại HOẶC bị đứt giữa chừng
+            self.flight_controller.abort()
+            self.flight_controller.set_worker(None)
             self.worker = None
+            self.drone_state.reset()
             self.set_ui_state_na()
             self.setWindowTitle("Drone Ground Station - Mất kết nối")
             QMessageBox.warning(self, "Cảnh báo Mạng", message)
@@ -211,6 +236,14 @@ class GCSApp(MainWindow):
         if "yaw" in data:
             dash.val_yaw.setText(f"{data['yaw']:.1f}°")
 
+        # ── Cập nhật Attitude 3D Widget ──
+        if any(k in data for k in ("roll", "pitch", "yaw")):
+            dash.widget_3d_attitude.update_attitude(
+                data.get("roll", dash.widget_3d_attitude._roll),
+                data.get("pitch", dash.widget_3d_attitude._pitch),
+                data.get("yaw", dash.widget_3d_attitude._yaw),
+            )
+
         # ── Cập nhật vòng tua động cơ 1960kv (từ DashboardTab) ──
         if "motor1" in data:
             dash.val_motor1.setText(str(data["motor1"]))
@@ -221,6 +254,29 @@ class GCSApp(MainWindow):
             dash.bar_motor3.setValue(data["motor3"])
             dash.val_motor4.setText(str(data["motor4"]))
             dash.bar_motor4.setValue(data["motor4"])
+
+        # ── Cập nhật độ cao từ barometer (MSP_ALTITUDE) ──
+        if "altitude" in data:
+            alt = data["altitude"]
+            self.drone_state.altitude = alt
+            dash.val_alt.setText(f"{alt:.1f} m")
+            dash.val_alt.setStyleSheet("color: #2196F3; font-weight: bold;")
+
+        if "vario" in data:
+            self.drone_state.vario = data["vario"]
+
+        # ── Cập nhật trạng thái ARM từ FC (MSP_STATUS) ──
+        if "is_armed" in data:
+            self.drone_state.is_armed = data["is_armed"]
+            if data["is_armed"]:
+                dash.val_armed.setText("ARMED")
+                dash.val_armed.setStyleSheet("color: red; font-weight: bold;")
+            else:
+                dash.val_armed.setText("DISARMED")
+                dash.val_armed.setStyleSheet("color: #4CAF50; font-weight: bold;")
+
+        if "flight_mode_flags" in data:
+            self.drone_state.flight_mode_flags = data["flight_mode_flags"]
 
     # ══════════════════════════════════════════════
     # QUẢN LÝ TRẠNG THÁI UI
@@ -258,14 +314,16 @@ class GCSApp(MainWindow):
         )
 
         # Khóa vùng điều khiển để tránh gửi lệnh khi mất mạng
-        dash.grp_manual_control.setEnabled(False)
+        self.manual_control_tab.setEnabled(False)
+        self.manual_control_tab.val_flight_status.setText("IDLE")
+        self.manual_control_tab.val_flight_status.setStyleSheet("color: gray;")
         self.mission_tab.setEnabled(False)
 
     def enable_ui_components(self):
         """Trạng thái có mạng: Mở khóa giao diện và chuyển nút thành NGẮT KẾT NỐI."""
         dash = self.dashboard_tab
 
-        dash.grp_manual_control.setEnabled(True)
+        self.manual_control_tab.setEnabled(True)
         self.mission_tab.setEnabled(True)
         dash.val_armed.setStyleSheet("color: red;")
         dash.val_gps_fix.setStyleSheet("color: #4CAF50;")
@@ -287,9 +345,73 @@ class GCSApp(MainWindow):
 
     def closeEvent(self, event):
         """Đảm bảo ngắt kết nối an toàn khi người dùng đóng cửa sổ."""
+        if self.flight_controller.is_active:
+            self.flight_controller.abort()
         if self.worker:
             self.worker.stop()
         event.accept()
+
+    # ══════════════════════════════════════════════
+    # SLOT: FLIGHT CONTROLLER
+    # ══════════════════════════════════════════════
+
+    def _confirm_takeoff(self):
+        """Hiện dialog xác nhận trước khi cất cánh tự động."""
+        reply = QMessageBox.question(
+            self,
+            "Xác nhận Takeoff",
+            "🚀 Drone sẽ tự động ARM, cất cánh và giữ ở 3 mét.\n\n"
+            "⚠️ Đảm bảo khu vực an toàn trước khi tiếp tục!\n\n"
+            "Bạn có muốn tiếp tục?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.flight_controller.takeoff_and_hold(3.0)
+
+    def _on_flight_status(self, message: str):
+        """Slot: Cập nhật trạng thái bay lên UI."""
+        self.manual_control_tab.val_flight_status.setText(message)
+        self.manual_control_tab.val_flight_status.setStyleSheet(
+            "color: #2196F3; font-weight: bold;"
+        )
+
+    def _on_takeoff_complete(self):
+        """Slot: Cất cánh thành công — cập nhật UI."""
+        self.manual_control_tab.val_flight_status.setStyleSheet(
+            "color: #4CAF50; font-weight: bold;"
+        )
+
+    def _on_flight_error(self, message: str):
+        """Slot: Lỗi bay — hiện cảnh báo và cập nhật UI."""
+        self.manual_control_tab.val_flight_status.setText(f"LỖI: {message}")
+        self.manual_control_tab.val_flight_status.setStyleSheet(
+            "color: red; font-weight: bold;"
+        )
+        QMessageBox.critical(self, "Lỗi Bay Tự Động", message)
+
+    def _on_flight_state_changed(self, new_state: str):
+        """Slot: State machine chuyển trạng thái."""
+        mc = self.manual_control_tab
+        if new_state == "IDLE":
+            mc.btn_takeoff_hold.setText("🚀 Takeoff & Hold 3m")
+            mc.btn_takeoff_hold.setStyleSheet(
+                "QPushButton { background-color: #FF9800; color: white; font-weight: bold; "
+                "font-size: 14px; border-radius: 6px; } "
+                "QPushButton:hover { background-color: #F57C00; } "
+                "QPushButton:disabled { background-color: #555; color: #888; }"
+            )
+            mc.btn_takeoff_hold.clicked.disconnect()
+            mc.btn_takeoff_hold.clicked.connect(self._confirm_takeoff)
+        else:
+            mc.btn_takeoff_hold.setText("⛔ ABORT")
+            mc.btn_takeoff_hold.setStyleSheet(
+                "QPushButton { background-color: #F44336; color: white; font-weight: bold; "
+                "font-size: 14px; border-radius: 6px; } "
+                "QPushButton:hover { background-color: #D32F2F; }"
+            )
+            mc.btn_takeoff_hold.clicked.disconnect()
+            mc.btn_takeoff_hold.clicked.connect(self.flight_controller.abort)
 
 
 # ══════════════════════════════════════════════════

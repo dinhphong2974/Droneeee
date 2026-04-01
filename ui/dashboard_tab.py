@@ -1,47 +1,60 @@
 """
-dashboard_tab.py - Tab giám sát chính: Telemetry, Motors, Manual Control.
+dashboard_tab.py - Tab giám sát chính: Attitude 3D + Telemetry + Motors.
 
 Chứa class DashboardTab(QWidget) bao gồm:
-- Bảng Telemetry: Pin, Attitude (Roll/Pitch/Yaw), GPS, Tốc độ
-- Bảng Motors: 4 thanh hiển thị vòng tua động cơ 1960kv (PWM 1000-2000)
-- Bảng Manual Control: Slider điều khiển + nút ARM/DISARM/RTH
+- Bên trái (65%): Widget mô phỏng tư thế drone (Artificial Horizon)
+- Bên phải (35%): Bảng Telemetry + Bảng Motors
 """
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QWidget, QGridLayout, QVBoxLayout, QHBoxLayout,
-    QGroupBox, QLabel, QProgressBar, QSlider, QPushButton
+    QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
+    QGroupBox, QLabel, QProgressBar, QSplitter
 )
+
+from ui.attitude_3d_widget import Attitude3DWidget
 
 
 class DashboardTab(QWidget):
-    """Tab chính hiển thị toàn bộ thông số bay và điều khiển thủ công."""
+    """Tab chính hiển thị tư thế bay 3D và thông số telemetry."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-
-        # Font in đậm dùng chung cho các giá trị hiển thị
         self._bold_font = QFont()
         self._bold_font.setBold(True)
-
         self._setup_ui()
 
     def _setup_ui(self):
-        """Xây dựng layout chính dạng lưới 2x2."""
-        layout = QGridLayout(self)
+        """Xây dựng layout: Attitude 3D (65%) | Telemetry + Motors (35%)."""
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        # [0,0] Bảng thông số bay (Telemetry)
+        # Sử dụng QSplitter để người dùng có thể resize
+        splitter = QSplitter(Qt.Horizontal)
+
+        # ── BÊN TRÁI: Attitude 3D (65%) ──
+        self.widget_3d_attitude = Attitude3DWidget()
+        splitter.addWidget(self.widget_3d_attitude)
+
+        # ── BÊN PHẢI: Telemetry + Motors (35%) ──
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(4, 4, 4, 4)
+
         self._create_telemetry_group()
-        layout.addWidget(self.grp_telemetry, 0, 0)
+        right_layout.addWidget(self.grp_telemetry)
 
-        # [0,1] Bảng điều khiển thủ công (Manual Control)
-        self._create_manual_control_group()
-        layout.addWidget(self.grp_manual_control, 0, 1)
-
-        # [1,0..1] Bảng vòng tua động cơ (Motors) — trải rộng 2 cột
         self._create_motors_group()
-        layout.addWidget(self.grp_motors, 1, 0, 1, 2)
+        right_layout.addWidget(self.grp_motors)
+
+        right_layout.addStretch()
+        splitter.addWidget(right_panel)
+
+        # Tỷ lệ mặc định 65:35
+        splitter.setSizes([650, 350])
+
+        layout.addWidget(splitter)
 
     # ══════════════════════════════════════════════
     # BẢNG TELEMETRY
@@ -51,84 +64,50 @@ class DashboardTab(QWidget):
         """Tạo bảng hiển thị thông số bay: Pin, Mode, Attitude, GPS."""
         self.grp_telemetry = QGroupBox("Telemetry Dashboard")
         grid = QGridLayout(self.grp_telemetry)
+        grid.setSpacing(6)
 
         # ── Cột trái: Trạng thái chung ──
+        row = 0
+        fields_left = [
+            ("lbl_batt_curr", "Battery Current", "val_batt_curr"),
+            ("lbl_mode",      "Mode",            "val_mode"),
+            ("lbl_armed",     "Armed",           "val_armed"),
+            ("lbl_alt",       "Altitude",        "val_alt"),
+        ]
+        for lbl_name, lbl_text, val_name in fields_left:
+            lbl = QLabel(lbl_text)
+            val = QLabel("N/A")
+            val.setFont(self._bold_font)
+            setattr(self, lbl_name, lbl)
+            setattr(self, val_name, val)
+            grid.addWidget(lbl, row, 0)
+            grid.addWidget(val, row, 1)
+            row += 1
 
-        # Dòng điện pin
-        self.lbl_batt_curr = QLabel("Battery Current")
-        self.val_batt_curr = QLabel("N/A")
-        self.val_batt_curr.setFont(self._bold_font)
-        grid.addWidget(self.lbl_batt_curr, 0, 0)
-        grid.addWidget(self.val_batt_curr, 0, 1)
-
-        # Chế độ bay
-        self.lbl_mode = QLabel("Mode")
-        self.val_mode = QLabel("N/A")
-        self.val_mode.setFont(self._bold_font)
-        grid.addWidget(self.lbl_mode, 1, 0)
-        grid.addWidget(self.val_mode, 1, 1)
-
-        # Trạng thái ARM
-        self.lbl_armed = QLabel("Armed")
-        self.val_armed = QLabel("N/A")
-        self.val_armed.setFont(self._bold_font)
-        grid.addWidget(self.lbl_armed, 2, 0)
-        grid.addWidget(self.val_armed, 2, 1)
-
-        # Độ cao
-        self.lbl_alt = QLabel("Altitude")
-        self.val_alt = QLabel("N/A")
-        self.val_alt.setFont(self._bold_font)
-        grid.addWidget(self.lbl_alt, 3, 0)
-        grid.addWidget(self.val_alt, 3, 1)
-
-        # Tọa độ GPS (nhóm con)
+        # GPS Coordinates (nhóm con)
         self._create_gps_coords_group()
-        grid.addWidget(self.grp_gps_coords, 4, 0, 1, 2)
+        grid.addWidget(self.grp_gps_coords, row, 0, 1, 2)
+        row += 1
 
         # ── Cột phải: Attitude + GPS Fix ──
-
-        # Roll
-        self.lbl_roll = QLabel("Roll")
-        self.val_roll = QLabel("N/A")
-        self.val_roll.setFont(self._bold_font)
-        grid.addWidget(self.lbl_roll, 0, 4)
-        grid.addWidget(self.val_roll, 0, 5)
-
-        # Pitch
-        self.lbl_pitch = QLabel("Pitch")
-        self.val_pitch = QLabel("N/A")
-        self.val_pitch.setFont(self._bold_font)
-        grid.addWidget(self.lbl_pitch, 1, 4)
-        grid.addWidget(self.val_pitch, 1, 5)
-
-        # Yaw
-        self.lbl_yaw = QLabel("Yaw")
-        self.val_yaw = QLabel("N/A")
-        self.val_yaw.setFont(self._bold_font)
-        grid.addWidget(self.lbl_yaw, 2, 4)
-        grid.addWidget(self.val_yaw, 2, 5)
-
-        # GPS Fix
-        self.lbl_gps_fix = QLabel("GPS Fix")
-        self.val_gps_fix = QLabel("N/A")
-        self.val_gps_fix.setFont(self._bold_font)
-        grid.addWidget(self.lbl_gps_fix, 3, 4)
-        grid.addWidget(self.val_gps_fix, 3, 5)
-
-        # Số vệ tinh
-        self.lbl_sats = QLabel("Satellites")
-        self.val_sats = QLabel("N/A")
-        self.val_sats.setFont(self._bold_font)
-        grid.addWidget(self.lbl_sats, 4, 4)
-        grid.addWidget(self.val_sats, 4, 5)
-
-        # Tốc độ mặt đất
-        self.lbl_spd = QLabel("Ground Speed")
-        self.val_spd = QLabel("N/A")
-        self.val_spd.setFont(self._bold_font)
-        grid.addWidget(self.lbl_spd, 5, 4)
-        grid.addWidget(self.val_spd, 5, 5)
+        row_r = 0
+        fields_right = [
+            ("lbl_roll",    "Roll",         "val_roll"),
+            ("lbl_pitch",   "Pitch",        "val_pitch"),
+            ("lbl_yaw",     "Yaw",          "val_yaw"),
+            ("lbl_gps_fix", "GPS Fix",      "val_gps_fix"),
+            ("lbl_sats",    "Satellites",   "val_sats"),
+            ("lbl_spd",     "Ground Speed", "val_spd"),
+        ]
+        for lbl_name, lbl_text, val_name in fields_right:
+            lbl = QLabel(lbl_text)
+            val = QLabel("N/A")
+            val.setFont(self._bold_font)
+            setattr(self, lbl_name, lbl)
+            setattr(self, val_name, val)
+            grid.addWidget(lbl, row_r, 3)
+            grid.addWidget(val, row_r, 4)
+            row_r += 1
 
     def _create_gps_coords_group(self):
         """Tạo nhóm hiển thị tọa độ GPS (Latitude/Longitude)."""
@@ -148,64 +127,6 @@ class DashboardTab(QWidget):
         grid.addWidget(self.val_lon, 0, 3)
 
     # ══════════════════════════════════════════════
-    # BẢNG ĐIỀU KHIỂN THỦ CÔNG (MANUAL CONTROL)
-    # ══════════════════════════════════════════════
-
-    def _create_manual_control_group(self):
-        """Tạo bảng slider điều khiển + nút ARM/DISARM/RTH."""
-        self.grp_manual_control = QGroupBox("Manual Control")
-        grid = QGridLayout(self.grp_manual_control)
-
-        # Cấu hình từng slider: (tên_label, text, tên_slider, tên_val, min, max, default, row)
-        slider_configs = [
-            ("lbl_throttle",    "Throttle", "slider_throttle", "val_throttle",    1000, 2000, 1000, 0),
-            ("lbl_roll_input",  "Roll",     "slider_roll",     "val_roll_input",  1000, 2000, 1500, 1),
-            ("lbl_pitch_input", "Pitch",    "slider_pitch",    "val_pitch_input", 1000, 2000, 1500, 2),
-            ("lbl_yaw_input",   "Yaw",      "slider_yaw",      "val_yaw_input",   1000, 2000, 1500, 3),
-            ("lbl_aux1",        "AUX1",     "slider_aux1",     "val_aux1",        1000, 2000, 1000, 4),
-            ("lbl_aux2",        "AUX2",     "slider_aux2",     "val_aux2",        1000, 2000, 1000, 5),
-        ]
-
-        for lbl_name, lbl_text, slider_name, val_name, min_v, max_v, default, row in slider_configs:
-            # Label mô tả
-            lbl = QLabel(lbl_text)
-            setattr(self, lbl_name, lbl)
-            grid.addWidget(lbl, row, 0)
-
-            # Slider điều khiển (PWM 1000-2000μs)
-            slider = QSlider(Qt.Horizontal)
-            slider.setMinimum(min_v)
-            slider.setMaximum(max_v)
-            slider.setValue(default)
-            setattr(self, slider_name, slider)
-            grid.addWidget(slider, row, 1)
-
-            # Giá trị hiển thị
-            val = QLabel(str(default))
-            setattr(self, val_name, val)
-            grid.addWidget(val, row, 2)
-
-        # ── Hàng nút bấm điều khiển ──
-        btn_layout = QHBoxLayout()
-
-        # Cấu hình nút: (tên_biến, text_hiển_thị)
-        button_configs = [
-            ("btn_send_manual",       "Send Manual"),
-            ("btn_arm",               "ARM"),
-            ("btn_disarm",            "DISARM"),
-            ("btn_hold",              "HOLD"),
-            ("btn_rth",               "RTH"),
-            ("btn_start_mission_main", "Start Mission"),
-        ]
-
-        for btn_name, btn_text in button_configs:
-            btn = QPushButton(btn_text)
-            setattr(self, btn_name, btn)
-            btn_layout.addWidget(btn)
-
-        grid.addLayout(btn_layout, 6, 0, 1, 3)
-
-    # ══════════════════════════════════════════════
     # BẢNG VÒNG TUA ĐỘNG CƠ (MOTORS)
     # ══════════════════════════════════════════════
 
@@ -214,24 +135,20 @@ class DashboardTab(QWidget):
         self.grp_motors = QGroupBox("Motors")
         h_layout = QHBoxLayout(self.grp_motors)
 
-        # Tạo 4 cột động cơ giống nhau (Motor 1 → Motor 4)
         for i in range(1, 5):
             v_layout = QVBoxLayout()
 
-            # Tên động cơ
             lbl = QLabel(f"Motor {i}")
             lbl.setAlignment(Qt.AlignCenter)
             setattr(self, f"lbl_motor{i}", lbl)
             v_layout.addWidget(lbl)
 
-            # Giá trị PWM hiện tại
             val = QLabel("1000")
             val.setFont(self._bold_font)
             val.setAlignment(Qt.AlignCenter)
             setattr(self, f"val_motor{i}", val)
             v_layout.addWidget(val)
 
-            # Thanh hiển thị vòng tua (PWM 1000-2000μs)
             bar = QProgressBar()
             bar.setMinimum(1000)
             bar.setMaximum(2000)

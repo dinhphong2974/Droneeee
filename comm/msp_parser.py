@@ -15,8 +15,11 @@ Thông số phần cứng liên quan:
 import struct
 
 # ── Mã lệnh MSP (MultiWii Serial Protocol) ──
-MSP_ATTITUDE = 108  # Lệnh lấy góc nghiêng (Roll, Pitch, Yaw)
-MSP_ANALOG = 110    # Lệnh lấy thông số pin (Voltage, Current)
+MSP_STATUS    = 101  # Lệnh lấy trạng thái ARM + flight mode flags
+MSP_ATTITUDE  = 108  # Lệnh lấy góc nghiêng (Roll, Pitch, Yaw)
+MSP_ALTITUDE  = 109  # Lệnh lấy độ cao ước lượng (barometer)
+MSP_ANALOG    = 110  # Lệnh lấy thông số pin (Voltage, Current)
+MSP_SET_RAW_RC = 200 # Lệnh gửi 8 kênh RC xuống FC (ARM, throttle, AUX...)
 
 # ── Header giao thức ──
 MSP_HEADER_REQUEST = b'$M<'   # PC gửi đi → FC
@@ -68,6 +71,24 @@ class MSPParser:
         msg.append(checksum)
 
         return bytes(msg)
+
+    def pack_set_raw_rc(self, channels: list[int]) -> bytes:
+        """
+        Đóng gói lệnh MSP_SET_RAW_RC gửi 8 kênh RC xuống Flight Controller.
+
+        Thứ tự kênh INAV (AETR): Roll, Pitch, Throttle, Yaw, AUX1-4.
+        Mỗi kênh là uint16 LE, range 1000-2000μs.
+
+        Args:
+            channels: List 8 giá trị kênh RC (1000-2000μs)
+
+        Returns:
+            bytes: Frame MSP hoàn chỉnh sẵn sàng gửi qua TCP
+        """
+        if len(channels) != 8:
+            raise ValueError(f"Cần đúng 8 kênh RC, nhận được {len(channels)}")
+        payload = struct.pack('<8H', *channels)
+        return self.pack_msg(MSP_SET_RAW_RC, payload)
 
     def parse_buffer(self, data: bytes) -> dict:
         """
@@ -188,6 +209,21 @@ class MSPParser:
                 result['pitch'] = pitch / 10.0
                 # Yaw gửi theo độ chuẩn (0-360°)
                 result['yaw'] = yaw
+
+            elif cmd == MSP_ALTITUDE and size >= 6:
+                # Cấu trúc: est_alt(4B int, cm) + vario(2B int, cm/s)
+                est_alt, vario = struct.unpack('<i h', payload[:6])
+                result['altitude'] = est_alt / 100.0  # cm → mét
+                result['vario'] = vario / 100.0        # cm/s → m/s
+
+            elif cmd == MSP_STATUS and size >= 11:
+                # Cấu trúc: cycle_time(2B) + i2c_errors(2B) + sensors(2B)
+                #          + flight_mode_flags(4B) + config_profile(1B)
+                cycle_time, i2c_err, sensors, flags, profile = struct.unpack(
+                    '<H H H I B', payload[:11]
+                )
+                result['is_armed'] = bool(flags & (1 << 0))  # Bit 0 = ARMED
+                result['flight_mode_flags'] = flags
 
         except struct.error:
             # Firmware FC phiên bản khác có thể có cấu trúc byte khác
