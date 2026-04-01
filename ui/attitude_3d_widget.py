@@ -1,222 +1,236 @@
 """
-attitude_3d_widget.py - Widget placeholder cho mô phỏng 3D tư thế drone.
+attitude_3d_widget.py
+Mô phỏng 3D tư thế drone dùng Panda3D + PySide6 + file GLB.
 
-Hiện tại là placeholder với nền tối và hướng dẫn tích hợp 3D.
-
-Để tích hợp 3D thực tế, sử dụng PyOpenGL hoặc vispy:
-    pip install PyOpenGL vispy
-
-Ví dụ tích hợp vispy (thư viện nhẹ, hỗ trợ PySide6):
-─────────────────────────────────────────────────────
-    from vispy import scene
-    from vispy.scene import visuals
-    from vispy.io import read_mesh
-
-    class Attitude3DWidget(scene.SceneCanvas):
-        def __init__(self):
-            super().__init__(keys='interactive', size=(800, 600))
-            self.unfreeze()
-            view = self.central_widget.add_view()
-            view.camera = scene.cameras.TurntableCamera(elevation=30, azimuth=45)
-
-            # Tải mô hình drone .obj hoặc .stl
-            vertices, faces, normals, _ = read_mesh('drone_model.obj')
-            self.mesh = visuals.Mesh(
-                vertices=vertices, faces=faces,
-                shading='smooth', color=(0.5, 0.5, 1.0, 1.0)
-            )
-            view.add(self.mesh)
-            self.freeze()
-
-        def update_attitude(self, roll, pitch, yaw):
-            from vispy.visuals.transforms import MatrixTransform
-            tr = MatrixTransform()
-            tr.rotate(roll, (1, 0, 0))
-            tr.rotate(pitch, (0, 1, 0))
-            tr.rotate(yaw, (0, 0, 1))
-            self.mesh.transform = tr
-            self.update()
-─────────────────────────────────────────────────────
-
-Ví dụ tích hợp PyOpenGL + QOpenGLWidget:
-─────────────────────────────────────────────────────
-    from PySide6.QtOpenGLWidgets import QOpenGLWidget
-    from OpenGL.GL import *
-    from stl import mesh  # numpy-stl
-
-    class Attitude3DWidget(QOpenGLWidget):
-        def __init__(self):
-            super().__init__()
-            self._roll = self._pitch = self._yaw = 0.0
-
-        def initializeGL(self):
-            glClearColor(0.1, 0.1, 0.15, 1.0)
-            glEnable(GL_DEPTH_TEST)
-            self._drone_mesh = mesh.Mesh.from_file('drone.stl')
-
-        def paintGL(self):
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-            glLoadIdentity()
-            glTranslatef(0, 0, -5)
-            glRotatef(self._pitch, 1, 0, 0)
-            glRotatef(self._roll, 0, 0, 1)
-            glRotatef(self._yaw, 0, 1, 0)
-            # Draw mesh triangles...
-
-        def update_attitude(self, roll, pitch, yaw):
-            self._roll, self._pitch, self._yaw = roll, pitch, yaw
-            self.update()
-─────────────────────────────────────────────────────
+Tính năng:
+- Nhúng Panda3D vào QWidget của PySide6
+- Tự động tìm model drone từ thư mục: ../assets/drone.glb
+- Tự động convert đường dẫn Windows sang chuẩn Panda3D VFS
+- Cập nhật realtime roll / pitch / yaw
 """
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QPainter, QColor, QPen, QBrush
+import os
 from PySide6.QtWidgets import QWidget
-import math
+from PySide6.QtCore import QTimer, Qt
+
+# Import thư viện Panda3D
+from panda3d.core import (
+    WindowProperties,
+    loadPrcFileData,
+    AmbientLight,
+    DirectionalLight,
+    LineSegs,
+    TextNode,
+    CardMaker,
+    Filename,  # <--- THÊM CLASS NÀY ĐỂ XỬ LÝ ĐƯỜNG DẪN WINDOWS
+)
+from direct.showbase.ShowBase import ShowBase
+
+
+class Panda3DEngine(ShowBase):
+    """Lõi render Panda3D."""
+
+    def __init__(self, parent_hwnd: int, width: int, height: int, model_path: str):
+        # Không cho Panda3D tự mở cửa sổ riêng
+        loadPrcFileData("", "window-type none")
+        loadPrcFileData("", "sync-video true")
+        loadPrcFileData("", "show-frame-rate-meter false")
+
+        loadPrcFileData("", "notify-level-windisplay error")
+
+        super().__init__()
+
+        # Nhúng cửa sổ Panda3D vào QWidget
+        props = WindowProperties()
+        props.setParentWindow(parent_hwnd)
+        props.setOrigin(0, 0)
+        props.setSize(max(1, width), max(1, height))
+        
+        self.makeDefaultPipe()
+        self.openDefaultWindow(props=props)
+        self.setBackgroundColor(0.9, 0.9, 0.9, 1.0)
+
+        # Node attitude: nhận yaw/pitch/roll realtime
+        self.attitude_node = self.render.attachNewNode("attitude_node")
+
+        # Node model: dùng để căn chỉnh trục model import
+        self.model_node = self.attitude_node.attachNewNode("model_node")
+
+        # Biến attitude hiện tại để smoothing
+        self.current_roll = 0.0
+        self.current_pitch = 0.0
+        self.current_yaw = 0.0
+
+        # Biến attitude đích
+        self.target_roll = 0.0
+        self.target_pitch = 0.0
+        self.target_yaw = 0.0
+
+        # Load model drone
+        self.drone_model = None
+        self._load_drone_model(model_path)
+
+        # Camera
+        self.disableMouse()
+        self.camera.setPos(0, -12, 4)
+        self.camera.lookAt(0, 0, 0)
+
+        # Ánh sáng
+        self._setup_lighting()
+        self._create_axes()
+
+    def _load_drone_model(self, model_path: str):
+        """Load model .glb và gắn vào scene."""
+        try:
+            self.drone_model = self.loader.loadModel(model_path)
+            self.drone_model.reparentTo(self.model_node)
+
+            # Đặt model tại gốc tọa độ
+            self.drone_model.setPos(0, 0, 0)
+            self.drone_model.setScale(8.0)
+            self.drone_model.setColorScale(1.0, 1.0, 1.0, 1.0)
+
+            # Cú pháp: setHpr(Heading, Pitch, Roll)
+            # Heading chính là góc xoay quanh trục Z (Yaw).
+            self.model_node.setHpr(90, 0, 0)
+
+
+        except Exception as e:
+            print(f"[ERROR] Không load được model '{model_path}': {e}")
+            self.drone_model = None
+
+    def _setup_lighting(self):
+        alight = AmbientLight("ambient_light")
+        alight.setColor((0.45, 0.45, 0.45, 1.0))
+        alnp = self.render.attachNewNode(alight)
+        self.render.setLight(alnp)
+
+        dlight = DirectionalLight("directional_light")
+        dlight.setColor((0.9, 0.9, 0.9, 1.0))
+        dlnp = self.render.attachNewNode(dlight)
+        dlnp.setHpr(45, -35, 0)
+        self.render.setLight(dlnp)
+
+    def _create_axes(self):
+        segs = LineSegs()
+        segs.setThickness(2.0)
+        segs.setColor(1, 0, 0, 1)
+        segs.moveTo(0, 0, 0); segs.drawTo(2, 0, 0)
+        segs.setColor(0, 1, 0, 1)
+        segs.moveTo(0, 0, 0); segs.drawTo(0, 2, 0)
+        segs.setColor(0, 0, 1, 1)
+        segs.moveTo(0, 0, 0); segs.drawTo(0, 0, 2)
+        axes_node = segs.create()
+        self.render.attachNewNode(axes_node)
+
+        self._make_axis_label("X", (2.15, 0, 0), (1, 0, 0, 1))
+        self._make_axis_label("Y", (0, 2.15, 0), (0, 1, 0, 1))
+        self._make_axis_label("Z", (0, 0, 2.15), (0, 0, 1, 1))
+
+    def _make_axis_label(self, text, pos, color):
+        text_node = TextNode(f"label_{text}")
+        text_node.setText(text)
+        text_node.setTextColor(*color)
+        text_node_path = self.render.attachNewNode(text_node)
+        text_node_path.setScale(0.25)
+        text_node_path.setPos(*pos)
+        text_node_path.setBillboardPointEye()
+
+    def _create_ground(self):
+        cm = CardMaker("ground")
+        cm.setFrame(-10, 10, -10, 10)
+        ground = self.render.attachNewNode(cm.generate())
+        ground.setP(-90)
+        ground.setZ(-1.5)
+        ground.setColor(0.15, 0.15, 0.18, 1.0)
+
+    def set_attitude_target(self, roll: float, pitch: float, yaw: float):
+        self.target_roll = roll
+        self.target_pitch = pitch
+        self.target_yaw = yaw
+
+    def update_attitude_smooth(self, alpha: float = 0.2):
+        self.current_roll = (1 - alpha) * self.current_roll + alpha * self.target_roll
+        self.current_pitch = (1 - alpha) * self.current_pitch + alpha * self.target_pitch
+        self.current_yaw = (1 - alpha) * self.current_yaw + alpha * self.target_yaw
+
+        self.attitude_node.setHpr(
+            -self.current_yaw,   # Yaw
+            self.current_roll,    # Roll
+            self.current_pitch  # Pitch
+            
+        )
 
 
 class Attitude3DWidget(QWidget):
-    """
-    Placeholder cho mô phỏng 3D tư thế drone (Roll/Pitch/Yaw).
+    """QWidget chứa Panda3D."""
 
-    Hiện tại vẽ Artificial Horizon 2D (giống đồng hồ bay thật).
-    Xem docstring module để biết cách tích hợp OpenGL 3D.
-    """
-
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, model_filename: str = "drone.glb"):
         super().__init__(parent)
-        self.setMinimumSize(300, 300)
+        self.setMinimumSize(400, 300)
+
+        # 1. Lấy thư mục chứa file attitude_3d_widget.py (thư mục 'ui')
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # 2. Lùi lại một cấp để ra thư mục gốc
+        root_dir = os.path.dirname(current_dir)
+        
+        # 3. Nối đường dẫn dạng OS thông thường (vd: C:\...\assets\drone.glb)
+        os_path = os.path.join(root_dir, 'assets', model_filename)
+        
+        # 4. CHUYỂN ĐỔI: Ép đường dẫn Windows sang chuẩn VFS của Panda3D
+        panda_path = Filename.fromOsSpecific(os_path)
+        
+        # Lấy chuỗi đường dẫn chuẩn (vd: /c/Test/.../assets/drone.glb)
+        self.model_path = panda_path.getFullpath()
+        
+        self.panda_engine = None
+
         self._roll = 0.0
         self._pitch = 0.0
         self._yaw = 0.0
 
+        self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer)
+        self.timer.timeout.connect(self._step_panda)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.panda_engine is None:
+            win_id = int(self.winId())
+            self.panda_engine = Panda3DEngine(
+                parent_hwnd=win_id,
+                width=self.width(),
+                height=self.height(),
+                model_path=self.model_path
+            )
+            self.timer.start(16)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.panda_engine and self.panda_engine.win:
+            props = WindowProperties()
+            props.setSize(max(1, self.width()), max(1, self.height()))
+            self.panda_engine.win.requestProperties(props)
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        if self.panda_engine:
+            try:
+                self.panda_engine.userExit()
+            except Exception:
+                pass
+        super().closeEvent(event)
+
+    def _step_panda(self):
+        if self.panda_engine:
+            self.panda_engine.update_attitude_smooth(alpha=0.2)
+            self.panda_engine.taskMgr.step()
+
     def update_attitude(self, roll: float, pitch: float, yaw: float):
-        """Cập nhật tư thế từ telemetry data."""
         self._roll = roll
         self._pitch = pitch
         self._yaw = yaw
-        self.update()
 
-    def paintEvent(self, event):
-        """Vẽ Artificial Horizon + Compass."""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        w, h = self.width(), self.height()
-        cx, cy = w // 2, h // 2
-        radius = min(w, h) // 2 - 20
-
-        # ── Nền tối ──
-        painter.fillRect(self.rect(), QColor(20, 20, 35))
-
-        # ── Vẽ Artificial Horizon ──
-        self._draw_horizon(painter, cx, cy, radius)
-
-        # ── Vẽ Compass (Yaw) ──
-        self._draw_compass(painter, cx, h - 40, radius)
-
-        # ── Vẽ thông số text ──
-        self._draw_readouts(painter, w, h)
-
-        painter.end()
-
-    def _draw_horizon(self, painter: QPainter, cx: int, cy: int, radius: int):
-        """Vẽ đường chân trời nhân tạo (Artificial Horizon)."""
-        painter.save()
-        painter.translate(cx, cy)
-        painter.rotate(-self._roll)
-
-        pitch_offset = self._pitch * 3  # 3px per degree
-
-        # Sky (xanh dương)
-        sky_color = QColor(25, 118, 210)
-        painter.setBrush(QBrush(sky_color))
-        painter.setPen(Qt.NoPen)
-        painter.drawRect(-radius, -radius + int(pitch_offset), radius * 2, radius)
-
-        # Ground (nâu)
-        ground_color = QColor(121, 85, 72)
-        painter.setBrush(QBrush(ground_color))
-        painter.drawRect(-radius, int(pitch_offset), radius * 2, radius)
-
-        # Horizon line
-        painter.setPen(QPen(QColor(255, 255, 255), 2))
-        painter.drawLine(-radius, int(pitch_offset), radius, int(pitch_offset))
-
-        # Pitch ladder
-        painter.setPen(QPen(QColor(255, 255, 255, 150), 1))
-        small_font = QFont("Consolas", 8)
-        painter.setFont(small_font)
-        for deg in range(-30, 31, 10):
-            if deg == 0:
-                continue
-            y = int(pitch_offset - deg * 3)
-            line_w = 30 if abs(deg) % 20 == 0 else 15
-            painter.drawLine(-line_w, y, line_w, y)
-            if abs(deg) % 20 == 0:
-                painter.drawText(line_w + 4, y + 4, f"{deg}°")
-
-        painter.restore()
-
-        # ── Center crosshair (cố định) ──
-        painter.setPen(QPen(QColor(255, 200, 0), 3))
-        painter.drawLine(cx - 30, cy, cx - 10, cy)
-        painter.drawLine(cx + 10, cy, cx + 30, cy)
-        painter.drawLine(cx, cy - 5, cx, cy + 5)
-
-        # ── Roll indicator arc ──
-        painter.save()
-        painter.translate(cx, cy)
-        painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
-        arc_r = radius - 10
-        for deg in [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]:
-            angle_rad = math.radians(deg - 90)
-            x1 = int(arc_r * math.cos(angle_rad))
-            y1 = int(arc_r * math.sin(angle_rad))
-            tick_len = 10 if deg % 30 == 0 else 5
-            x2 = int((arc_r - tick_len) * math.cos(angle_rad))
-            y2 = int((arc_r - tick_len) * math.sin(angle_rad))
-            painter.drawLine(x1, y1, x2, y2)
-        painter.restore()
-
-    def _draw_compass(self, painter: QPainter, cx: int, cy: int, radius: int):
-        """Vẽ compass bar đơn giản cho Yaw."""
-        painter.setPen(QPen(QColor(200, 200, 220), 1))
-        bar_w = min(radius * 2, 300)
-        bar_h = 24
-        x0 = cx - bar_w // 2
-
-        # Background
-        painter.setBrush(QBrush(QColor(30, 30, 50, 200)))
-        painter.drawRoundedRect(x0, cy - bar_h // 2, bar_w, bar_h, 4, 4)
-
-        # Compass labels
-        painter.setPen(QColor(200, 200, 220))
-        compass_font = QFont("Consolas", 9, QFont.Bold)
-        painter.setFont(compass_font)
-        directions = {0: "N", 45: "NE", 90: "E", 135: "SE",
-                      180: "S", 225: "SW", 270: "W", 315: "NW"}
-        for deg, label in directions.items():
-            offset = ((deg - self._yaw + 180) % 360 - 180)
-            px = cx + int(offset * bar_w / 180)
-            if x0 < px < x0 + bar_w:
-                painter.drawText(px - 8, cy + 5, label)
-
-        # Center triangle
-        painter.setPen(QPen(QColor(255, 200, 0), 2))
-        painter.drawLine(cx, cy - bar_h // 2 - 4, cx - 4, cy - bar_h // 2 + 2)
-        painter.drawLine(cx, cy - bar_h // 2 - 4, cx + 4, cy - bar_h // 2 + 2)
-
-    def _draw_readouts(self, painter: QPainter, w: int, h: int):
-        """Vẽ giá trị Roll/Pitch/Yaw dạng text."""
-        painter.setPen(QColor(200, 200, 220))
-        readout_font = QFont("Consolas", 11, QFont.Bold)
-        painter.setFont(readout_font)
-
-        texts = [
-            f"ROLL  {self._roll:+6.1f}°",
-            f"PITCH {self._pitch:+6.1f}°",
-            f"YAW   {self._yaw:6.1f}°",
-        ]
-        for i, txt in enumerate(texts):
-            painter.drawText(10, 25 + i * 20, txt)
+        if self.panda_engine:
+            self.panda_engine.set_attitude_target(roll, pitch, yaw)
