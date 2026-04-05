@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QSpinBox, QInputDialog
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebChannel import QWebChannel
 
 try:
@@ -205,6 +206,20 @@ class MissionTab(QWidget):
         self.map_view = QWebEngineView()
         self.map_view.setMinimumSize(500, 400)
 
+        # ── FIX "L is not defined": Cho phép local HTML load CDN resources ──
+        # Mặc định QWebEngineView chặn remote URLs từ file:// (Same-Origin Policy)
+        # Leaflet CDN (https://cdn.jsdelivr.net) sẽ KHÔNG load nếu thiếu dòng này
+        settings = self.map_view.settings()
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
+        )
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.JavascriptEnabled, True
+        )
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalStorageEnabled, True
+        )
+
         # ── Thiết lập QWebChannel với WebBridge RIÊNG BIỆT ──
         # KHÔNG đăng ký self (MissionTab) vào channel
         # → tránh cảnh báo "Property has no notify signal"
@@ -257,22 +272,30 @@ class MissionTab(QWidget):
         self.map_is_ready = True
 
         # ── Inject JavaScript: Click listener cho Leaflet map ──
-        # Chạy SAU KHI Leaflet đã sẵn sàng (loadFinished = True)
+        # FIX race condition: Dùng watchdog loop chờ Leaflet (L) + QWebChannel (qt)
+        # thực sự sẵn sàng trước khi bind event. Retry mỗi 100ms, tối đa 50 lần (5s).
         click_handler_js = """
-        (function() {
-            // Khởi tạo QWebChannel để giao tiếp Python <-> JavaScript
+        (function waitForLeaflet(retries) {
+            if (typeof retries === 'undefined') retries = 50;
+            if (typeof L === 'undefined' || typeof qt === 'undefined') {
+                if (retries > 0) {
+                    setTimeout(function() { waitForLeaflet(retries - 1); }, 100);
+                } else {
+                    console.error('[DroneGCS] Leaflet hoặc QWebChannel không load được sau 5s');
+                }
+                return;
+            }
             new QWebChannel(qt.webChannelTransport, function(channel) {
                 var bridge = channel.objects.bridge;
-
-                // Tìm đối tượng map Leaflet (folium tạo biến global theo ID của div)
                 var mapContainers = document.querySelectorAll('.folium-map');
                 if (mapContainers.length > 0) {
                     var mapId = mapContainers[0].id;
                     var map = window[mapId];
-                    if (map) {
+                    if (map && typeof map.on === 'function') {
                         map.on('click', function(e) {
                             bridge.on_map_clicked(e.latlng.lat, e.latlng.lng);
                         });
+                        console.log('[DroneGCS] Map click listener đã được gắn thành công');
                     }
                 }
             });
@@ -367,10 +390,11 @@ class MissionTab(QWidget):
                 opacity=0.7
             ).add_to(m)
 
-        # ── Thêm script qrc cho QWebChannel (chỉ load thư viện, KHÔNG thao tác DOM) ──
-        # Click listener sẽ được inject bởi _on_map_loaded() sau khi loadFinished
+        # ── Thêm script qrc cho QWebChannel vào <head> ──
+        # PHẢI nằm trong <head> cùng Leaflet để biến `qt` sẵn sàng
+        # trước khi waitForLeaflet() chạy trong _on_map_loaded()
         webchannel_script = '<script src="qrc:///qtwebchannel/qwebchannel.js"></script>'
-        m.get_root().html.add_child(folium.Element(webchannel_script))
+        m.get_root().header.add_child(folium.Element(webchannel_script))
 
         # Lưu ra file HTML tạm
         m.save(self._map_file)
