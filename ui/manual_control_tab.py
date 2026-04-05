@@ -37,7 +37,7 @@ class ManualControlTab(QWidget):
         layout.addWidget(self.grp_commands)
 
         # ── Nút Takeoff & Hold ──
-        self.btn_takeoff_hold = QPushButton("🚀 Takeoff & Hold 3m")
+        self.btn_takeoff_hold = QPushButton("🚀 Takeoff")
         self.btn_takeoff_hold.setMinimumHeight(44)
         self.btn_takeoff_hold.setStyleSheet(
             "QPushButton { background-color: #FF9800; color: white; font-weight: bold; "

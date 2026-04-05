@@ -40,8 +40,26 @@ class DroneState:
         # ── Từ MSP_MOTOR (chưa implement) ──
         self.motors: list[int] = [1000, 1000, 1000, 1000]
 
+        # ── Từ MSP_RAW_GPS ── (Cảm biến GPS BZ 251)
+        self.gps_fix_type: int = 0          # 0=No fix, 1=2D, 2=3D
+        self.gps_num_sat: int = 0           # Số vệ tinh
+        self.latitude: float = 0.0          # Vĩ độ (độ thập phân, VD: 21.0285)
+        self.longitude: float = 0.0         # Kinh độ (độ thập phân, VD: 105.8542)
+        self.gps_altitude: float = 0.0      # Độ cao GPS (mét)
+        self.ground_speed: float = 0.0      # Tốc độ mặt đất (m/s)
+        self.ground_course: float = 0.0     # Hướng di chuyển (độ, 0-360)
+        self.gps_hdop: float = 0.0          # Độ chính xác ngang (HDOP)
+
+        # ── Vị trí Home (Read-only từ FC, INAV tự chốt khi ARM) ──
+        self.home_lat: float = 0.0          # Vĩ độ Home
+        self.home_lon: float = 0.0          # Kinh độ Home
+        self.has_home: bool = False         # Đã chốt Home chưa
+
         # ── Trạng thái kết nối ──
         self.is_connected: bool = False
+
+        # ── Trạng thái mode bay hiện tại (cho emergency overlay) ──
+        self.active_mode_name: str = ""     # Tên mode đang chạy (ARM, Takeoff, Mission...)
 
     def reset(self):
         """Reset toàn bộ trạng thái về mặc định (khi mất kết nối)."""

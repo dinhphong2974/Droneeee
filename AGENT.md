@@ -2,7 +2,7 @@
 
 > **Mục đích**: Cung cấp toàn bộ bối cảnh dự án cho AI agent. Đọc file này TRƯỚC khi code bất kỳ thứ gì.
 >
-> **Cập nhật lần cuối**: 2026-03-30
+> **Cập nhật lần cuối**: 2026-04-05
 
 ---
 
@@ -17,8 +17,10 @@
 ```
 
 - **ESP32** hoạt động như Access Point Wifi, tạo mạng riêng (`Drone_GCS_Wifi`), IP mặc định `192.168.4.1:8080`
-- ESP32 là **transparent bridge**: nhận TCP từ PC → chuyển UART xuống FC, nhận UART từ FC → chuyển TCP lên PC
-- ESP32 có **Watchdog Failsafe**: nếu mất tín hiệu PC > 1 giây → ngắt kết nối, chờ reconnect
+- ESP32 là **cầu nối + failsafe chủ động**: nhận TCP từ PC → chuyển UART xuống FC, nhận UART từ FC → chuyển TCP lên PC
+- ESP32 có **Active Failsafe**: nếu mất tín hiệu PC > 1.5 giây → tự gửi MSP_SET_RAW_RC với AUX4=2000 (RTH) qua UART
+- ESP32 nhận cấu hình failsafe từ PC qua prefix `FS:rth` hoặc `FS:ignore`
+- **GPS + La bàn**: BZ 251 kết nối trực tiếp vào FC, cung cấp tọa độ GPS qua MSP_RAW_GPS
 
 ### Tech Stack
 
@@ -37,31 +39,36 @@
 
 ```
 DroneGCS/
-├── main.py                      ← Entry point + Điều phối Signal/Slot (class GCSApp)
+├── main.py                      ← Entry point + Điều phối Signal/Slot (class GCSApp + TakeoffDialog)
 ├── AGENT.md                     ← File này
+├── memories.md                  ← Nhật ký phát triển (Development Log)
 ├── _test_ui_refactor.py         ← Script test kiểm tra widget names
 │
 ├── comm/                        ← Package giao tiếp mạng
 │   ├── __init__.py
 │   ├── wifi_client.py           ← Socket TCP thô (connect/send/receive/close)
-│   ├── wifi_worker.py           ← QThread chạy ngầm (polling loop 20Hz)
-│   └── msp_parser.py            ← Đóng gói/giải mã giao thức MSP
+│   ├── wifi_worker.py           ← QThread chạy ngầm (polling loop 20Hz, MSP_RAW_GPS)
+│   └── msp_parser.py            ← Đóng gói/giải mã MSP (ANALOG, ATTITUDE, ALTITUDE, STATUS, RAW_GPS, SET_WP)
 │
 ├── core/                        ← Package logic nghiệp vụ
 │   ├── __init__.py
-│   └── drone_state.py           ← Placeholder — sẽ lưu trạng thái drone chia sẻ
+│   ├── drone_state.py           ← Trạng thái drone chia sẻ (GPS, altitude, ARM, home position)
+│   └── flight_controller.py    ← State machine bay tự động (ARM, Takeoff, Safe Land, RTH, Mission)
 │
 ├── ui/                          ← Package giao diện
 │   ├── __init__.py
-│   ├── main_window.py           ← Cửa sổ chính (Top Bar + Tab Widget) — Pure Python
-│   ├── dashboard_tab.py         ← Tab Dashboard (Telemetry + Motors + Manual Control)
-│   ├── mission_tab.py           ← Tab Mission (Waypoint Planning)
+│   ├── main_window.py           ← Cửa sổ chính (Nav Rail + Stacked Pages) — Pure Python
+│   ├── dashboard_tab.py         ← Tab Dashboard (Attitude 3D + Telemetry + Motors)
+│   ├── manual_control_tab.py    ← Tab Manual Control (Sliders + ARM/DISARM/Takeoff)
+│   ├── mission_tab.py           ← Tab Mission (OpenStreetMap + Waypoints + Safety Logic)
+│   ├── emergency_overlay.py     ← Overlay cảnh báo khẩn cấp (DISARM + Safe Land)
+│   ├── attitude_3d_widget.py    ← Widget mô phỏng tư thế drone (Artificial Horizon)
 │   ├── config_tab.py            ← Tab Config (placeholder)
-│   ├── gcs_dashboard.py         ← ⚠️ LEGACY — Auto-generated từ Qt Designer, KHÔNG DÙNG NỮA
-│   └── gcs_dashboard.ui         ← ⚠️ LEGACY — File Qt Designer gốc, KHÔNG DÙNG NỮA
+│   ├── gcs_dashboard.py         ← ⚠️ LEGACY — KHÔNG DÙNG NỮA
+│   └── gcs_dashboard.ui         ← ⚠️ LEGACY — KHÔNG DÙNG NỮA
 │
 └── ESP32/
-    └── main.py                  ← Firmware MicroPython cho ESP32 (transparent bridge + failsafe)
+    └── main.py                  ← Firmware MicroPython (cầu nối + failsafe chủ động RTH/SafeLand)
 ```
 
 ---
@@ -345,27 +352,33 @@ QMainWindow
 - [x] Kết nối TCP Wifi tới ESP32
 - [x] Giải mã MSP_ANALOG (Voltage, Current)
 - [x] Giải mã MSP_ATTITUDE (Roll, Pitch, Yaw)
-- [x] Hiển thị Telemetry trên Dashboard
+- [x] Giải mã MSP_ALTITUDE (Altitude, Vario)
+- [x] Giải mã MSP_STATUS (ARM status, flight mode flags)
+- [x] Giải mã MSP_RAW_GPS (GPS BZ 251: lat, lon, sats, speed, fix)
+- [x] Hiển thị Telemetry trên Dashboard (pin, góc, GPS, altitude)
 - [x] Hiển thị PWM 4 Motor (thanh dọc)
-- [x] Mock Test mode (giả lập dữ liệu)
+- [x] Mock Test mode (giả lập dữ liệu + GPS)
 - [x] Connection Dialog (nhập IP/Port hoặc Mock)
 - [x] Quản lý trạng thái kết nối/mất kết nối trên UI
-- [x] ESP32 firmware transparent bridge + failsafe
-- [x] Tab Mission — Form nhập waypoint + bảng hiển thị
+- [x] ESP32 firmware failsafe chủ động (RTH/SafeLand khi mất WiFi)
+- [x] ARM / DISARM (state machine + RC link safety)
+- [x] Takeoff & Hold (dialog nhập độ cao + ALTHOLD+POSHOLD)
+- [x] Safe Land (AUX3=2000 → FC hạ cánh tại chỗ)
+- [x] RTH — Return To Home (AUX4=2000 → FC bay về home)
+- [x] Emergency Overlay (nút DISARM + Safe Land nổi trên UI)
+- [x] Tab Mission — OpenStreetMap + Waypoints tương tác + Logic an toàn
+- [x] MSP_SET_WP — Upload waypoints xuống FC
+- [x] Cấu hình failsafe từ PC xuống ESP32 (FS:rth / FS:ignore)
+- [x] DroneState — Centralized state management (GPS + Home position)
+- [x] Dark theme + animations + responsive layout
 - [x] Test script kiểm tra widget names (`_test_ui_refactor.py`)
 
 ### 🚧 Đang phát triển / Chưa implement
 
 - [ ] **Gửi lệnh Manual Control** (slider → MSP_SET_RAW_RC → FC)
-- [ ] **ARM / DISARM / RTH** (nút bấm → MSP command → FC)
-- [ ] **Start/Stop Mission** (gửi waypoint lên FC, kích hoạt nav)
 - [ ] **Tab Config**: PID Tuning, Rate Profiles, Motor Mapping
 - [ ] **Tab Log**: Ghi log telemetry lịch sử
-- [ ] **GPS Map**: Hiển thị vị trí drone trên bản đồ
-- [ ] **Thêm lệnh MSP**: MSP_RAW_GPS, MSP_MOTOR, MSP_STATUS, MSP_RC
-- [ ] **core/drone_state.py**: Centralized state management
 - [ ] **Motor data từ FC** (hiện chỉ có trong Mock, chưa parse MSP_MOTOR)
-- [ ] **Cải thiện UI**: Dark theme, animations, responsive layout
 
 ---
 
@@ -408,9 +421,23 @@ python _test_ui_refactor.py
 
 ---
 
-## 12. Lịch Sử Thay Đổi
+## 12. Ánh Xạ Kênh AUX (MSP_SET_RAW_RC)
+
+Thứ tự kênh: `[Roll, Pitch, Yaw, Throttle, AUX1, AUX2, AUX3, AUX4]`
+
+| Kênh | FC Channel | Chức năng | 1000 | 1500 | 2000 |
+|---|---|---|---|---|---|
+| AUX1 | CH5 | ARM/DISARM | DISARM | — | ARM |
+| AUX2 | CH6 | Flight Mode | Acro | ANGLE | ALTHOLD+POSHOLD |
+| AUX3 | CH7 | Safe Land | OFF | — | Kích hoạt hạ cánh |
+| AUX4 | CH8 | RTH | OFF | — | Kích hoạt RTH |
+
+---
+
+## 13. Lịch Sử Thay Đổi
 
 | Ngày | Mô tả |
 |---|---|
-| 2026-03-30 | **Refactoring kiến trúc lớn**: Tách monolithic code thành module riêng biệt. Tạo `MainWindow`, `DashboardTab`, `MissionTab`, `ConfigTab`. GCSApp kế thừa MainWindow. Loại bỏ phụ thuộc vào file `.ui` auto-generated. Viết test script kiểm tra widget names. |
+| 2026-03-30 | **Refactoring kiến trúc lớn**: Tách monolithic code thành module riêng biệt. Tạo `MainWindow`, `DashboardTab`, `MissionTab`, `ConfigTab`. GCSApp kế thừa MainWindow. |
 | 2026-03-30 | Cập nhật AGENT.md toàn diện với đầy đủ context cho AI agent. |
+| 2026-04-05 | **Feature Update lớn**: ESP32 failsafe chủ động (RTH/SafeLand), Emergency Overlay, Takeoff Dialog (nhập độ cao + GPS), Mission Tab với OpenStreetMap (folium + QWebEngineView), MSP_RAW_GPS + MSP_SET_WP, AUX channel mapping mới (4 AUX), DroneState GPS fields, cấu hình failsafe từ PC. |

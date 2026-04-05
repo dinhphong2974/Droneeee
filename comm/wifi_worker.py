@@ -7,6 +7,13 @@ Module này điều phối giữa WifiClient (kết nối thô) và MSPParser (g
 3. Phát Signal chứa dữ liệu đã giải mã lên UI
 4. Nhận lệnh từ UI thread qua command queue (thread-safe)
 
+Lệnh MSP polling:
+- MSP_ANALOG (110): Điện áp pin
+- MSP_ATTITUDE (108): Góc nghiêng
+- MSP_ALTITUDE (109): Độ cao barometer
+- MSP_STATUS (101): Trạng thái ARM
+- MSP_RAW_GPS (106): Tọa độ GPS BZ 251
+
 KHÔNG chứa logic socket hay logic bóc tách gói tin.
 """
 
@@ -14,13 +21,14 @@ import time
 import struct
 import random
 import socket
+import math
 from queue import Queue, Empty
 from PySide6.QtCore import QThread, Signal
 
 from comm.wifi_client import WifiClient
 from comm.msp_parser import (
     MSPParser, MSP_ANALOG, MSP_ATTITUDE, MSP_ALTITUDE, MSP_STATUS,
-    MSP_SET_RAW_RC, MSP_HEADER_REQUEST
+    MSP_RAW_GPS, MSP_SET_RAW_RC, MSP_HEADER_REQUEST
 )
 
 
@@ -66,6 +74,14 @@ class WifiWorker(QThread):
         self._mock_channels = [1500, 1500, 1000, 1500, 1000, 1500, 1000, 1000]
         self._mock_armed = False
         self._mock_altitude = 0.0
+        # Mock GPS (Hà Nội mặc định)
+        self._mock_gps_lat = 21.028500
+        self._mock_gps_lon = 105.854200
+        self._mock_gps_fix = 2   # 3D fix
+        self._mock_gps_sats = 12
+        self._mock_gps_speed = 0.0
+        self._mock_home_lat = 21.028500
+        self._mock_home_lon = 105.854200
 
     def run(self):
         """Điểm bắt đầu của thread — tự chạy khi gọi self.start()."""
@@ -87,6 +103,7 @@ class WifiWorker(QThread):
 
         Args:
             data: Frame MSP đã đóng gói (output của MSPParser.pack_msg)
+                  hoặc lệnh cấu hình failsafe (VD: "FS:rth")
         """
         self._command_queue.put(data)
 
@@ -104,7 +121,8 @@ class WifiWorker(QThread):
             self.connection_status.emit(True, f"Đã kết nối Wifi với {self.ip}")
 
             # Danh sách các lệnh MSP sẽ hỏi FC luân phiên
-            cmds_to_request = [MSP_ANALOG, MSP_ATTITUDE, MSP_ALTITUDE, MSP_STATUS]
+            # Thêm MSP_RAW_GPS để lấy tọa độ từ GPS BZ 251
+            cmds_to_request = [MSP_ANALOG, MSP_ATTITUDE, MSP_ALTITUDE, MSP_STATUS, MSP_RAW_GPS]
             cmd_index = 0
 
             # Bước 2: Vòng lặp hỏi-đáp liên tục
@@ -114,7 +132,6 @@ class WifiWorker(QThread):
                     self._drain_command_queue()
 
                     # ── Poll telemetry từ FC ──
-                    # PC HỎI: Đóng gói lệnh MSP và gửi qua TCP
                     current_cmd = cmds_to_request[cmd_index]
                     msg_to_send = self._parser.pack_msg(current_cmd)
                     self._client.send(msg_to_send)
@@ -125,14 +142,14 @@ class WifiWorker(QThread):
                     # GIẢI MÃ: Ném data thô vào parser để bóc tách
                     parsed_dict = self._parser.parse_buffer(raw_data)
 
-                    # Nếu có dữ liệu hợp lệ (pin, góc nghiêng...), phát lên UI
+                    # Nếu có dữ liệu hợp lệ, phát lên UI
                     if parsed_dict:
                         self.telemetry_data.emit(parsed_dict)
 
                 except socket.timeout:
                     pass  # Bỏ qua nếu FC chưa kịp trả lời
 
-                # Luân phiên hỏi lệnh tiếp theo (pin → góc → cao độ → status → ...)
+                # Luân phiên hỏi lệnh tiếp theo
                 cmd_index = (cmd_index + 1) % len(cmds_to_request)
 
                 # Nghỉ giữa các lần hỏi (20Hz)
@@ -158,7 +175,7 @@ class WifiWorker(QThread):
     # ══════════════════════════════════════════════
 
     def _run_mock_mode(self):
-        """Giả lập dữ liệu telemetry + phản hồi lệnh bay để test UI."""
+        """Giả lập dữ liệu telemetry + GPS + phản hồi lệnh bay để test UI."""
         self.connection_status.emit(True, "Đang chạy chế độ Mock Test (Giả lập)")
 
         # Thông số gốc giả lập cho pin 6S (19.8V rỗng - 25.2V đầy)
@@ -171,6 +188,9 @@ class WifiWorker(QThread):
 
             # ── Giả lập vật lý bay (altitude thay đổi theo throttle) ──
             self._update_mock_physics()
+
+            # ── Giả lập GPS (vị trí thay đổi nhẹ khi armed) ──
+            self._update_mock_gps()
 
             # Giả lập pin tụt dần (Lipo 6S: 19.8V cạn - 25.2V đầy)
             mock_volt -= random.uniform(0.001, 0.01)
@@ -185,7 +205,7 @@ class WifiWorker(QThread):
             throttle = self._mock_channels[2]
             motor_base = max(1000, int(throttle * 0.9 + 100)) if self._mock_armed else 1000
 
-            # Đóng gói và phát dữ liệu giả lên UI
+            # Đóng gói và phát dữ liệu giả lên UI (telemetry + GPS)
             fake_data = {
                 "voltage": mock_volt,
                 "pitch": mock_pitch,
@@ -199,6 +219,14 @@ class WifiWorker(QThread):
                 "vario": 0.0,
                 "is_armed": self._mock_armed,
                 "flight_mode_flags": (1 if self._mock_armed else 0),
+                # ── GPS Data (từ GPS BZ 251 giả lập) ──
+                "gps_fix_type": self._mock_gps_fix,
+                "gps_num_sat": self._mock_gps_sats,
+                "latitude": self._mock_gps_lat,
+                "longitude": self._mock_gps_lon,
+                "gps_altitude": self._mock_altitude,
+                "ground_speed": self._mock_gps_speed,
+                "ground_course": random.uniform(0, 360),
             }
             self.telemetry_data.emit(fake_data)
 
@@ -212,41 +240,70 @@ class WifiWorker(QThread):
         while True:
             try:
                 cmd_data = self._command_queue.get_nowait()
+
+                # Bỏ qua lệnh cấu hình failsafe (prefix FS:)
+                if isinstance(cmd_data, bytes) and cmd_data.startswith(b'FS:'):
+                    continue
+
                 # Tìm frame MSP_SET_RAW_RC: $M< + size(16) + cmd(200) + payload(16B) + checksum
-                if (len(cmd_data) >= 22 and cmd_data[0:3] == MSP_HEADER_REQUEST
+                if (isinstance(cmd_data, bytes) and len(cmd_data) >= 22
+                        and cmd_data[0:3] == MSP_HEADER_REQUEST
                         and cmd_data[4] == MSP_SET_RAW_RC):
                     payload = cmd_data[5:21]
                     channels = list(struct.unpack('<8H', payload))
                     self._mock_channels = channels
-                    # AUX1 (index 4) > 1700 → ARM (dải kích hoạt INAV: 1750-2100)
+                    # AUX1 (index 4) > 1700 → ARM (dải kích hoạt: 2000)
                     self._mock_armed = channels[4] > 1700
+
+                    # AUX3 (index 6) > 1700 → Safe Land giả lập
+                    if channels[6] > 1700 and self._mock_armed:
+                        # Giả lập hạ cánh: giảm altitude dần
+                        self._mock_altitude = max(0.0, self._mock_altitude - 0.3)
+                        if self._mock_altitude <= 0.1:
+                            self._mock_armed = False
+                            self._mock_altitude = 0.0
+
+                    # AUX4 (index 7) > 1700 → RTH giả lập
+                    if channels[7] > 1700 and self._mock_armed:
+                        # Giả lập RTH: di chuyển về home dần
+                        self._mock_gps_lat += (self._mock_home_lat - self._mock_gps_lat) * 0.05
+                        self._mock_gps_lon += (self._mock_home_lon - self._mock_gps_lon) * 0.05
             except Empty:
                 break
 
     def _update_mock_physics(self):
         """Giả lập vật lý: altitude thay đổi theo throttle khi armed."""
         if not self._mock_armed:
-            # Chưa ARM → altitude giảm về 0 (hoặc giữ ở 0)
             self._mock_altitude = max(0.0, self._mock_altitude - 0.1)
             return
 
         throttle = self._mock_channels[2]
-        aux2_althold = self._mock_channels[5] > 1800  # ALTHOLD: dải 1900-2100
+        aux2_althold = self._mock_channels[5] > 1800  # ALTHOLD+POSHOLD: 2000
 
         if aux2_althold:
-            # ALTHOLD mode: giữ altitude ổn định (dao động nhỏ)
+            # ALTHOLD+POSHOLD mode: giữ altitude ổn định
             self._mock_altitude += random.uniform(-0.05, 0.05)
             self._mock_altitude = max(0.0, self._mock_altitude)
         else:
             # Manual mode: altitude phụ thuộc throttle
             if throttle > 1400:
-                # Đang bay — tăng/giảm altitude dựa trên throttle
-                climb_rate = (throttle - 1450) / 200.0  # ~0.25m/tick ở throttle 1500
-                self._mock_altitude += climb_rate * 0.05  # nhân với POLLING_INTERVAL
+                climb_rate = (throttle - 1450) / 200.0
+                self._mock_altitude += climb_rate * 0.05
                 self._mock_altitude = max(0.0, self._mock_altitude)
             elif self._mock_altitude > 0:
-                # Throttle thấp — giảm dần
                 self._mock_altitude = max(0.0, self._mock_altitude - 0.05)
+
+    def _update_mock_gps(self):
+        """Giả lập GPS: vị trí thay đổi nhẹ khi armed (drift tự nhiên)."""
+        if self._mock_armed:
+            # Giả lập drift GPS nhỏ khi đang bay
+            self._mock_gps_lat += random.uniform(-0.000002, 0.000002)
+            self._mock_gps_lon += random.uniform(-0.000002, 0.000002)
+            self._mock_gps_speed = random.uniform(0.0, 2.0) if self._mock_altitude > 0.5 else 0.0
+            self._mock_gps_sats = random.randint(10, 14)
+        else:
+            self._mock_gps_speed = 0.0
+            self._mock_gps_sats = random.randint(8, 14)
 
     # ══════════════════════════════════════════════
     # ĐIỀU KHIỂN TỪ BÊN NGOÀI

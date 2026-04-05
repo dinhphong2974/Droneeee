@@ -7,27 +7,50 @@ Module này xử lý toàn bộ logic bóc tách gói tin MSP:
 - Quản lý buffer chống đứt gói do lag mạng Wifi
 - Tính và xác thực checksum chống nhiễu
 
+Lệnh MSP hỗ trợ:
+- MSP_STATUS (101): Trạng thái ARM + flight mode flags
+- MSP_RAW_GPS (106): Tọa độ GPS, số vệ tinh, tốc độ (từ GPS BZ 251)
+- MSP_ATTITUDE (108): Góc nghiêng Roll, Pitch, Yaw
+- MSP_ALTITUDE (109): Độ cao barometer + vario
+- MSP_ANALOG (110): Điện áp pin, dòng điện
+- MSP_WP_GETINFO (20): Thông tin mission (số waypoint)
+- MSP_SET_RAW_RC (200): Gửi 8 kênh RC (ARM, throttle, AUX1-4)
+- MSP_SET_WP (209): Gửi waypoint xuống FC cho NAV WP mission
+
 Thông số phần cứng liên quan:
 - Pin: Lipo 6S (19.8V rỗng → 25.2V đầy)
 - Động cơ: 1960kv (PWM range: 1000-2000μs)
+- GPS: BZ 251 (GPS + La bàn)
 """
 
 import struct
 
-# ── Mã lệnh MSP (MultiWii Serial Protocol) ──
-MSP_STATUS    = 101  # Lệnh lấy trạng thái ARM + flight mode flags
-MSP_ATTITUDE  = 108  # Lệnh lấy góc nghiêng (Roll, Pitch, Yaw)
-MSP_ALTITUDE  = 109  # Lệnh lấy độ cao ước lượng (barometer)
-MSP_ANALOG    = 110  # Lệnh lấy thông số pin (Voltage, Current)
-MSP_SET_RAW_RC = 200 # Lệnh gửi 8 kênh RC xuống FC (ARM, throttle, AUX...)
+# ══════════════════════════════════════════════
+# MÃ LỆNH MSP (MultiWii Serial Protocol)
+# ══════════════════════════════════════════════
+
+# ── Lệnh đọc dữ liệu (FC → PC) ──
+MSP_WP_GETINFO = 20    # Lấy thông tin mission (tổng số waypoint, max WP)
+MSP_STATUS     = 101   # Lấy trạng thái ARM + flight mode flags
+MSP_RAW_GPS    = 106   # Lấy tọa độ GPS, vệ tinh, tốc độ (từ GPS BZ 251)
+MSP_ATTITUDE   = 108   # Lấy góc nghiêng (Roll, Pitch, Yaw)
+MSP_ALTITUDE   = 109   # Lấy độ cao ước lượng (barometer)
+MSP_ANALOG     = 110   # Lấy thông số pin (Voltage, Current)
+
+# ── Lệnh ghi dữ liệu (PC → FC) ──
+MSP_SET_RAW_RC = 200   # Gửi 8 kênh RC xuống FC (ARM, throttle, AUX...)
+MSP_SET_WP     = 209   # Gửi 1 waypoint xuống FC cho NAV WP mission
 
 # ── Header giao thức ──
-MSP_HEADER_REQUEST = b'$M<'   # PC gửi đi → FC
-MSP_HEADER_RESPONSE = b'$M>'  # FC trả về → PC
+MSP_HEADER_REQUEST  = b'$M<'   # PC gửi đi → FC
+MSP_HEADER_RESPONSE = b'$M>'   # FC trả về → PC
 
 # ── Cấu hình pin Lipo 6S ──
 LIPO_6S_VOLTAGE_DIVIDER = 10.0  # FC gửi điện áp nhân 10 (VD: 245 → 24.5V)
 CURRENT_DIVIDER = 100.0          # FC gửi dòng điện nhân 100
+
+# ── GPS ──
+GPS_COORD_SCALE = 10_000_000.0  # Hệ số chia tọa độ GPS (lat/lon x 10^7)
 
 # ── Kích thước frame tối thiểu ──
 MIN_FRAME_SIZE = 6  # Header(3) + Size(1) + Cmd(1) + Checksum(1)
@@ -35,7 +58,7 @@ MIN_FRAME_SIZE = 6  # Header(3) + Size(1) + Cmd(1) + Checksum(1)
 
 class MSPParser:
     """
-    Bộ giải mã giao thức MSP cho giao tiếp với Flight Controller (INAV/Betaflight).
+    Bộ giải mã giao thức MSP cho giao tiếp với Flight Controller (INAV).
 
     Xử lý hai chiều:
     - pack_msg(): PC → ESP32 → FC (đóng gói lệnh request)
@@ -45,6 +68,10 @@ class MSPParser:
     def __init__(self):
         """Khởi tạo parser với buffer rỗng để gom gói tin bị đứt khúc."""
         self.buffer = bytearray()
+
+    # ══════════════════════════════════════════════
+    # ĐÓNG GÓI LỆNH GỬI ĐI (PC → FC)
+    # ══════════════════════════════════════════════
 
     def pack_msg(self, cmd: int, payload: bytes = b'') -> bytes:
         """
@@ -76,7 +103,7 @@ class MSPParser:
         """
         Đóng gói lệnh MSP_SET_RAW_RC gửi 8 kênh RC xuống Flight Controller.
 
-        Thứ tự kênh INAV (AETR): Roll, Pitch, Throttle, Yaw, AUX1-4.
+        Thứ tự kênh INAV: [Roll, Pitch, Yaw, Throttle, AUX1, AUX2, AUX3, AUX4]
         Mỗi kênh là uint16 LE, range 1000-2000μs.
 
         Args:
@@ -89,6 +116,51 @@ class MSPParser:
             raise ValueError(f"Cần đúng 8 kênh RC, nhận được {len(channels)}")
         payload = struct.pack('<8H', *channels)
         return self.pack_msg(MSP_SET_RAW_RC, payload)
+
+    def pack_set_wp(self, wp_no: int, lat: float, lon: float, alt_cm: int,
+                    p1: int = 0, p2: int = 0, p3: int = 0) -> bytes:
+        """
+        Đóng gói lệnh MSP_SET_WP gửi 1 waypoint xuống FC.
+
+        INAV sử dụng lệnh này để nạp mission waypoint vào bộ nhớ FC.
+        Sau khi nạp tất cả WP, bật mode NAV WP (qua AUX) để FC tự bay.
+
+        Args:
+            wp_no: Số thứ tự waypoint (1-N cho mission, 0=RTH, 255=POSHOLD)
+            lat: Vĩ độ (độ thập phân, VD: 21.0285)
+            lon: Kinh độ (độ thập phân, VD: 105.8542)
+            alt_cm: Độ cao tương đối so với Home (cm)
+            p1: Tham số 1 — Tốc độ (cm/s) hoặc thời gian dừng (giây)
+            p2: Tham số 2 — Dự phòng
+            p3: Tham số 3 — Cờ đặc biệt (0x48 = flag cho WP cuối cùng)
+
+        Returns:
+            bytes: Frame MSP hoàn chỉnh
+        """
+        # Chuyển đổi tọa độ sang đơn vị INAV (nhân 10^7)
+        lat_int = int(lat * GPS_COORD_SCALE)
+        lon_int = int(lon * GPS_COORD_SCALE)
+
+        # Đóng gói payload 21 bytes: wp_no(1) + action(1) + lat(4) + lon(4) + alt(4) + p1(2) + p2(2) + p3(2) + flag(1)
+        # Cấu trúc INAV MSP_SET_WP:
+        # Byte 0: wp_no (uint8)
+        # Byte 1: action (uint8) — 1=WAYPOINT, 4=RTH
+        # Byte 2-5: lat (int32, x10^7)
+        # Byte 6-9: lon (int32, x10^7)
+        # Byte 10-13: alt (int32, cm relative to home)
+        # Byte 14-15: p1 (int16) — speed cm/s
+        # Byte 16-17: p2 (int16)
+        # Byte 18: p3 (uint8) — flags (0x48 = last WP flag)
+        action = 1  # WAYPOINT action code
+        payload = struct.pack('<BB i i i h h B',
+                              wp_no, action,
+                              lat_int, lon_int, alt_cm,
+                              p1, p2, p3)
+        return self.pack_msg(MSP_SET_WP, payload)
+
+    # ══════════════════════════════════════════════
+    # GIẢI MÃ DỮ LIỆU NHẬN VỀ (FC → PC)
+    # ══════════════════════════════════════════════
 
     def parse_buffer(self, data: bytes) -> dict:
         """
@@ -189,7 +261,11 @@ class MSPParser:
 
         Lệnh hỗ trợ:
         - MSP_ANALOG (110): Điện áp pin 6S, dòng điện
+        - MSP_RAW_GPS (106): Tọa độ GPS, số vệ tinh, tốc độ
         - MSP_ATTITUDE (108): Góc Roll, Pitch, Yaw
+        - MSP_ALTITUDE (109): Độ cao barometer + vario
+        - MSP_STATUS (101): Trạng thái ARM + flight mode flags
+        - MSP_WP_GETINFO (20): Thông tin mission
         """
         result = {}
 
@@ -224,6 +300,39 @@ class MSPParser:
                 )
                 result['is_armed'] = bool(flags & (1 << 0))  # Bit 0 = ARMED
                 result['flight_mode_flags'] = flags
+
+            elif cmd == MSP_RAW_GPS and size >= 16:
+                # ═══════════════════════════════════════
+                # MSP_RAW_GPS (106) — Dữ liệu từ GPS BZ 251
+                # ═══════════════════════════════════════
+                # Cấu trúc: fix_type(1B) + num_sat(1B) + lat(4B int32, x10^7)
+                #          + lon(4B int32, x10^7) + alt(2B int16, mét)
+                #          + ground_speed(2B uint16, cm/s)
+                #          + ground_course(2B uint16, độ x10)
+                fix_type, num_sat, lat_raw, lon_raw, alt, speed, course = struct.unpack(
+                    '<B B i i h H H', payload[:16]
+                )
+                result['gps_fix_type'] = fix_type       # 0=No fix, 1=2D, 2=3D
+                result['gps_num_sat'] = num_sat         # Số vệ tinh
+                result['latitude'] = lat_raw / GPS_COORD_SCALE   # Vĩ độ thập phân
+                result['longitude'] = lon_raw / GPS_COORD_SCALE  # Kinh độ thập phân
+                result['gps_altitude'] = alt             # Mét
+                result['ground_speed'] = speed / 100.0   # cm/s → m/s
+                result['ground_course'] = course / 10.0  # Độ (0-360)
+
+                # HDOP nếu có byte thứ 16-17
+                if size >= 18:
+                    hdop = struct.unpack('<H', payload[16:18])[0]
+                    result['gps_hdop'] = hdop / 100.0
+
+            elif cmd == MSP_WP_GETINFO and size >= 3:
+                # ═══════════════════════════════════════
+                # MSP_WP_GETINFO (20) — Thông tin mission
+                # ═══════════════════════════════════════
+                # Cấu trúc: reserved(1B) + max_waypoints(1B) + is_valid(1B)
+                reserved, max_wp, is_valid = struct.unpack('<B B B', payload[:3])
+                result['wp_max'] = max_wp
+                result['wp_is_valid'] = bool(is_valid)
 
         except struct.error:
             # Firmware FC phiên bản khác có thể có cấu trúc byte khác

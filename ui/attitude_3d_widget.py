@@ -197,14 +197,19 @@ class Attitude3DWidget(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         if self.panda_engine is None:
-            win_id = int(self.winId())
-            self.panda_engine = Panda3DEngine(
-                parent_hwnd=win_id,
-                width=self.width(),
-                height=self.height(),
-                model_path=self.model_path
-            )
-            self.timer.start(16)
+            try:
+                win_id = int(self.winId())
+                self.panda_engine = Panda3DEngine(
+                    parent_hwnd=win_id,
+                    width=self.width(),
+                    height=self.height(),
+                    model_path=self.model_path
+                )
+                self.timer.start(16)
+            except Exception as e:
+                print(f"[Attitude3DWidget] Lỗi khởi tạo Panda3D: {e}")
+                print(f"[Attitude3DWidget] Model path: {self.model_path}")
+                self.panda_engine = None
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
