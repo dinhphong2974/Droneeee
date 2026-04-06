@@ -2,26 +2,28 @@
 mission_tab.py - Tab lập trình lộ trình bay tích hợp bản đồ OpenStreetMap.
 
 Chứa class MissionTab(QWidget) bao gồm:
-- Bản đồ OpenStreetMap nhúng qua QWebEngineView + folium
-- Drone marker cập nhật vị trí real-time từ GPS BZ 251
+- Bản đồ OpenStreetMap nhúng qua QWebEngineView + Leaflet.js (local)
+- Drone marker cập nhật vị trí real-time từ GPS BZ 251 (KHÔNG reload page)
 - Path tracking — vẽ đường bay theo thời gian thực
 - Click-to-add-waypoint — nhấp chuột lên bản đồ để tạo waypoint
 - Bảng danh sách Waypoint + nút điều khiển
 - Logic an toàn: Cảnh báo khoảng cách + cấu hình failsafe
 
-Bug fixes (2026-04-05):
-- Fix QWebChannel warning spam: Tách WebBridge(QObject) riêng biệt,
-  không đăng ký MissionTab trực tiếp vào QWebChannel.
-- Fix "L is not defined": Dùng loadFinished signal + map_is_ready flag,
-  JavaScript chỉ chạy sau khi Leaflet đã load xong.
+Architecture:
+    assets/map.html     ← Leaflet map (self-contained, local JS/CSS)
+    ↕ QWebChannel       ← Cầu nối JavaScript ↔ Python
+    mission_tab.py      ← Python backend (QWebEngineView)
 
-Thư viện: PySide6-WebEngine, folium (đã cài đặt sẵn)
+Luồng dữ liệu:
+    GPS data → update_drone_position() → runJavaScript("updateDronePosition(...)")
+    Map click → JS bridge.on_map_clicked() → WebBridge.map_clicked signal → _handle_map_click()
+
+KHÔNG CÒN dùng folium. Leaflet.js load local từ assets/leaflet/.
 """
 
 import os
 import json
 import math
-import tempfile
 from PySide6.QtCore import Qt, Slot, QUrl, Signal, QObject
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
@@ -33,11 +35,6 @@ from PySide6.QtWidgets import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebChannel import QWebChannel
-
-try:
-    import folium
-except ImportError:
-    folium = None
 
 
 # ══════════════════════════════════════════════
@@ -135,20 +132,23 @@ class MissionTab(QWidget):
 
         # ── Dữ liệu nội bộ ──
         self._waypoints = []            # List[dict]: {"lat", "lon", "alt"}
-        self._drone_path = []           # List[tuple]: [(lat, lon), ...] đường bay
         self._drone_lat = 0.0           # Vĩ độ drone hiện tại
         self._drone_lon = 0.0           # Kinh độ drone hiện tại
+        self._drone_heading = 0.0       # Hướng bay (yaw)
         self._home_lat = 0.0            # Vĩ độ Home
         self._home_lon = 0.0            # Kinh độ Home
         self._has_home = False          # Đã có vị trí Home chưa
-        self._map_initialized = False   # Bản đồ đã load chưa
         self._distance_threshold = self.DEFAULT_DISTANCE_THRESHOLD
 
         # ── Cờ chống race condition: JavaScript chỉ chạy khi map đã load xong ──
         self.map_is_ready = False
 
-        # ── File tạm cho bản đồ HTML ──
-        self._map_file = os.path.join(tempfile.gettempdir(), "drone_gcs_map.html")
+        # ── Đường dẫn tuyệt đối tới assets/map.html ──
+        # os.path.abspath đảm bảo QUrl.fromLocalFile hoạt động đúng
+        # bất kể working directory hiện tại là gì
+        self._map_html_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', 'assets', 'map.html')
+        )
 
         # ── WebBridge: Cầu nối riêng biệt cho QWebChannel ──
         self._web_bridge = WebBridge(self)
@@ -195,10 +195,10 @@ class MissionTab(QWidget):
         layout.addWidget(splitter)
 
         # ── Tải bản đồ ban đầu ──
-        self._load_initial_map()
+        self._load_map()
 
     # ══════════════════════════════════════════════
-    # BẢN ĐỒ (QWebEngineView + folium)
+    # BẢN ĐỒ (QWebEngineView + Leaflet local)
     # ══════════════════════════════════════════════
 
     def _create_map_view(self):
@@ -206,9 +206,10 @@ class MissionTab(QWidget):
         self.map_view = QWebEngineView()
         self.map_view.setMinimumSize(500, 400)
 
-        # ── FIX "L is not defined": Cho phép local HTML load CDN resources ──
-        # Mặc định QWebEngineView chặn remote URLs từ file:// (Same-Origin Policy)
-        # Leaflet CDN (https://cdn.jsdelivr.net) sẽ KHÔNG load nếu thiếu dòng này
+        # ── Cấu hình WebEngine settings ──
+        # LocalContentCanAccessRemoteUrls: Cho phép file:// load tile từ OSM
+        # JavascriptEnabled: Bắt buộc cho Leaflet
+        # LocalStorageEnabled: Cache tiles nếu cần
         settings = self.map_view.settings()
         settings.setAttribute(
             QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
@@ -227,192 +228,134 @@ class MissionTab(QWidget):
         self._web_channel.registerObject("bridge", self._web_bridge)
         self.map_view.page().setWebChannel(self._web_channel)
 
-        # ── Kết nối loadFinished để chạy JS sau khi Leaflet đã sẵn sàng ──
-        # FIX: "L is not defined" — do runJavaScript() chạy trước khi Leaflet load
+        # ── Kết nối loadFinished để biết khi nào map sẵn sàng ──
+        # JavaScript chỉ chạy SAFE sau khi signal này fire với ok=True
         self.map_view.loadFinished.connect(self._on_map_loaded)
 
-    def _load_initial_map(self):
-        """Tải bản đồ OpenStreetMap ban đầu với folium."""
-        if folium is None:
-            self.map_view.setHtml(
-                "<html><body style='background:#1a1a2e; color:#c0c0e0; "
-                "display:flex; align-items:center; justify-content:center;'>"
-                "<h2>⚠️ Thư viện folium chưa được cài đặt</h2>"
-                "</body></html>"
-            )
-            return
+    def _load_map(self):
+        """
+        Tải file map.html local vào QWebEngineView.
 
-        # Reset cờ — map chưa sẵn sàng cho đến khi loadFinished
+        Dùng QUrl.fromLocalFile với đường dẫn tuyệt đối để QWebEngine
+        có thể resolve relative paths (leaflet/leaflet.js, leaflet/leaflet.css)
+        từ vị trí thực tế của map.html trên disk.
+        """
         self.map_is_ready = False
 
-        # Tọa độ mặc định: Hà Nội
-        default_lat, default_lon = 21.0285, 105.8542
+        if not os.path.isfile(self._map_html_path):
+            self.map_view.setHtml(
+                "<html><body style='background:#1a1a2e; color:#F44336; "
+                "display:flex; align-items:center; justify-content:center;'>"
+                f"<h2>⚠️ Không tìm thấy file: {self._map_html_path}</h2>"
+                "</body></html>"
+            )
+            print(f"[MissionTab] ERROR: map.html not found at {self._map_html_path}")
+            return
 
-        self._generate_map_html(default_lat, default_lon)
-        self.map_view.setUrl(QUrl.fromLocalFile(self._map_file))
-        self._map_initialized = True
+        url = QUrl.fromLocalFile(self._map_html_path)
+        self.map_view.setUrl(url)
+        print(f"[MissionTab] Loading map from: {url.toString()}")
 
     def _on_map_loaded(self, ok: bool):
         """
         Callback khi QWebEngineView tải xong HTML.
 
-        FIX cho lỗi "L is not defined":
-        - Leaflet (L) chỉ có sẵn SAU KHI HTML load xong hoàn toàn
-        - Mọi logic JavaScript thao tác với L phải nằm trong hàm này
-        - Set cờ map_is_ready = True để các hàm khác biết có thể gọi runJavaScript()
+        window.onload trong map.html đã xử lý việc:
+        - Kiểm tra typeof L !== 'undefined'
+        - Tạo Leaflet map
+        - Setup QWebChannel bridge
+        - Bind map click event
+
+        Python side CHỈ CẦN set cờ map_is_ready = True ở đây.
+        Mọi runJavaScript() gọi sau thời điểm này là an toàn.
 
         Args:
             ok: True nếu tải thành công, False nếu lỗi
         """
         if not ok:
-            print("[MissionTab] Lỗi tải bản đồ HTML")
+            print("[MissionTab] ERROR: Failed to load map.html")
             self.map_is_ready = False
             return
 
         self.map_is_ready = True
+        print("[MissionTab] OK - map.html loaded successfully")
 
-        # ── Inject JavaScript: Click listener cho Leaflet map ──
-        # FIX race condition: Dùng watchdog loop chờ Leaflet (L) + QWebChannel (qt)
-        # thực sự sẵn sàng trước khi bind event. Retry mỗi 100ms, tối đa 50 lần (5s).
-        click_handler_js = """
-        (function waitForLeaflet(retries) {
-            if (typeof retries === 'undefined') retries = 50;
-            if (typeof L === 'undefined' || typeof qt === 'undefined') {
-                if (retries > 0) {
-                    setTimeout(function() { waitForLeaflet(retries - 1); }, 100);
-                } else {
-                    console.error('[DroneGCS] Leaflet hoặc QWebChannel không load được sau 5s');
-                }
-                return;
-            }
-            new QWebChannel(qt.webChannelTransport, function(channel) {
-                var bridge = channel.objects.bridge;
-                var mapContainers = document.querySelectorAll('.folium-map');
-                if (mapContainers.length > 0) {
-                    var mapId = mapContainers[0].id;
-                    var map = window[mapId];
-                    if (map && typeof map.on === 'function') {
-                        map.on('click', function(e) {
-                            bridge.on_map_clicked(e.latlng.lat, e.latlng.lng);
-                        });
-                        console.log('[DroneGCS] Map click listener đã được gắn thành công');
-                    }
-                }
-            });
-        })();
+        # ── Sync lại dữ liệu hiện có lên map (nếu có) ──
+        # Trường hợp: GPS data đã nhận trước khi map load xong
+        if self._has_home:
+            self._js_update_home()
+        if self._drone_lat != 0.0 or self._drone_lon != 0.0:
+            self._js_update_drone()
+        if self._waypoints:
+            self._js_update_waypoints()
+
+    # ══════════════════════════════════════════════
+    # JAVASCRIPT BRIDGE — Gọi JS từ Python
+    # ══════════════════════════════════════════════
+    # Tất cả hàm _js_*() chỉ gọi runJavaScript() khi map_is_ready.
+    # KHÔNG BAO GIỜ reload page — chỉ thao tác DOM qua JS functions
+    # đã được định nghĩa sẵn trong map.html.
+
+    def _run_js(self, script: str):
         """
-        self.map_view.page().runJavaScript(click_handler_js)
+        Helper an toàn để chạy JavaScript — chỉ thực thi khi map sẵn sàng.
 
-    def _generate_map_html(self, center_lat, center_lon, zoom=16):
-        """
-        Tạo file HTML chứa bản đồ OpenStreetMap bằng folium.
-
-        Bản đồ có:
-        - Home marker (nếu đã ARM)
-        - Drone marker (vị trí hiện tại)
-        - Waypoint markers (đánh số)
-        - Mission route (đường nối waypoints)
-        - Đường bay tracking (polyline xanh)
-
-        KHÔNG inject JavaScript click listener ở đây.
-        Click listener được inject trong _on_map_loaded() sau khi Leaflet sẵn sàng.
+        Nếu map chưa ready, bỏ qua (không queue — dữ liệu sẽ được
+        sync lại trong _on_map_loaded khi map load xong).
 
         Args:
-            center_lat, center_lon: Tâm bản đồ
-            zoom: Mức zoom ban đầu
+            script: Đoạn JavaScript cần thực thi
         """
-        # Tạo bản đồ folium với tile mặc định OpenStreetMap
-        m = folium.Map(
-            location=[center_lat, center_lon],
-            zoom_start=zoom,
-            tiles='OpenStreetMap'
+        if self.map_is_ready:
+            self.map_view.page().runJavaScript(script)
+
+    def _js_update_drone(self):
+        """Gọi JS updateDronePosition() — di chuyển drone marker."""
+        self._run_js(
+            f"updateDronePosition({self._drone_lat}, {self._drone_lon}, {self._drone_heading});"
         )
 
-        # ── Thêm Home marker nếu có ──
-        if self._has_home:
-            folium.Marker(
-                [self._home_lat, self._home_lon],
-                popup="🏠 HOME",
-                icon=folium.Icon(color='green', icon='home', prefix='fa'),
-                tooltip="Home Position"
-            ).add_to(m)
+    def _js_update_home(self):
+        """Gọi JS updateHomePosition() — đặt/di chuyển home marker."""
+        self._run_js(
+            f"updateHomePosition({self._home_lat}, {self._home_lon});"
+        )
 
-        # ── Thêm Drone marker (vị trí hiện tại) ──
-        if self._drone_lat != 0.0 or self._drone_lon != 0.0:
-            folium.Marker(
-                [self._drone_lat, self._drone_lon],
-                popup="🛸 Drone",
-                icon=folium.Icon(color='red', icon='plane', prefix='fa'),
-                tooltip="Drone Position"
-            ).add_to(m)
+    def _js_update_waypoints(self):
+        """Gọi JS updateWaypoints() — vẽ lại tất cả waypoint markers + route."""
+        wp_json = json.dumps(self._waypoints)
+        self._run_js(f"updateWaypoints('{wp_json}');")
 
-        # ── Thêm Waypoint markers (đánh số) ──
-        for i, wp in enumerate(self._waypoints):
-            folium.Marker(
-                [wp["lat"], wp["lon"]],
-                popup=f"WP {i+1}: Alt {wp['alt']}m",
-                icon=folium.DivIcon(html=f"""
-                    <div style="
-                        background-color: #FF9800;
-                        color: white;
-                        border-radius: 50%;
-                        width: 28px;
-                        height: 28px;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        font-weight: bold;
-                        font-size: 13px;
-                        border: 2px solid white;
-                        box-shadow: 0 2px 6px rgba(0,0,0,0.4);
-                    ">{i+1}</div>
-                """),
-                tooltip=f"Waypoint {i+1}"
-            ).add_to(m)
+    def _js_set_view(self, lat: float, lon: float, zoom: int = 0):
+        """Gọi JS setMapView() — di chuyển bản đồ tới vị trí."""
+        self._run_js(f"setMapView({lat}, {lon}, {zoom});")
 
-        # ── Vẽ đường nối waypoints (mission route) ──
-        if len(self._waypoints) >= 2:
-            wp_coords = [[wp["lat"], wp["lon"]] for wp in self._waypoints]
-            folium.PolyLine(
-                wp_coords,
-                color='#FF9800',
-                weight=3,
-                opacity=0.8,
-                dash_array='10'
-            ).add_to(m)
+    def _js_clear_all(self):
+        """Gọi JS clearAll() — xóa toàn bộ markers và polylines."""
+        self._run_js("clearAll();")
 
-        # ── Vẽ đường bay (path tracking real-time) ──
-        if len(self._drone_path) >= 2:
-            folium.PolyLine(
-                self._drone_path,
-                color='#2196F3',
-                weight=2,
-                opacity=0.7
-            ).add_to(m)
-
-        # ── Thêm script qrc cho QWebChannel vào <head> ──
-        # PHẢI nằm trong <head> cùng Leaflet để biến `qt` sẵn sàng
-        # trước khi waitForLeaflet() chạy trong _on_map_loaded()
-        webchannel_script = '<script src="qrc:///qtwebchannel/qwebchannel.js"></script>'
-        m.get_root().header.add_child(folium.Element(webchannel_script))
-
-        # Lưu ra file HTML tạm
-        m.save(self._map_file)
+    # ══════════════════════════════════════════════
+    # REFRESH MAP (legacy compatibility)
+    # ══════════════════════════════════════════════
 
     def refresh_map(self):
-        """Tải lại bản đồ với dữ liệu cập nhật (waypoints, drone position, path)."""
-        if folium is None or not self._map_initialized:
+        """
+        Cập nhật bản đồ với dữ liệu hiện tại.
+
+        KHÁC VỚI BẢN CŨ: Không reload toàn bộ HTML.
+        Chỉ gọi JS functions để cập nhật markers/polylines.
+        → Không flicker, không mất state.
+        """
+        if not self.map_is_ready:
             return
 
-        # Reset cờ — map sẽ reload, Leaflet chưa sẵn sàng
-        self.map_is_ready = False
+        self._js_update_waypoints()
 
-        center_lat = self._drone_lat if self._drone_lat != 0.0 else 21.0285
-        center_lon = self._drone_lon if self._drone_lon != 0.0 else 105.8542
+        if self._has_home:
+            self._js_update_home()
 
-        self._generate_map_html(center_lat, center_lon)
-        self.map_view.setUrl(QUrl.fromLocalFile(self._map_file))
-        # map_is_ready sẽ được set True trong _on_map_loaded() callback
+        if self._drone_lat != 0.0 or self._drone_lon != 0.0:
+            self._js_update_drone()
 
     # ══════════════════════════════════════════════
     # XỬ LÝ CLICK TỪ BẢN ĐỒ (qua WebBridge)
@@ -433,8 +376,8 @@ class MissionTab(QWidget):
             "Thêm Waypoint",
             f"Tọa độ: ({lat:.6f}, {lon:.6f})\n\nNhập độ cao (mét):",
             value=10.0,
-            min=1.0,
-            max=120.0,
+            minValue=1.0,
+            maxValue=120.0,
             decimals=1
         )
         if ok:
@@ -591,8 +534,8 @@ class MissionTab(QWidget):
         self.table_waypoints.setItem(row, 2, QTableWidgetItem(f"{lon:.6f}"))
         self.table_waypoints.setItem(row, 3, QTableWidgetItem(f"{alt:.1f}"))
 
-        # Cập nhật bản đồ
-        self.refresh_map()
+        # Cập nhật waypoint markers trên bản đồ (KHÔNG reload page)
+        self._js_update_waypoints()
 
         # Phát signal
         self.waypoints_updated.emit(self._waypoints)
@@ -606,42 +549,41 @@ class MissionTab(QWidget):
             # Cập nhật lại số thứ tự
             for i in range(self.table_waypoints.rowCount()):
                 self.table_waypoints.setItem(i, 0, QTableWidgetItem(str(i + 1)))
-            self.refresh_map()
+            self._js_update_waypoints()
             self.waypoints_updated.emit(self._waypoints)
 
     def _clear_all_waypoints(self):
         """Xóa toàn bộ waypoint."""
         self._waypoints.clear()
         self.table_waypoints.setRowCount(0)
-        self.refresh_map()
+        self._js_update_waypoints()
         self.waypoints_updated.emit(self._waypoints)
 
     # ══════════════════════════════════════════════
     # CẬP NHẬT VỊ TRÍ DRONE (gọi từ GCSApp)
     # ══════════════════════════════════════════════
 
-    def update_drone_position(self, lat: float, lon: float):
+    def update_drone_position(self, lat: float, lon: float, heading: float = 0.0):
         """
         Cập nhật vị trí drone hiện tại trên bản đồ.
 
         Được gọi từ GCSApp khi nhận GPS data từ telemetry.
+        KHÔNG reload page — gọi JS updateDronePosition() để di chuyển marker.
 
         Args:
             lat: Vĩ độ drone hiện tại
             lon: Kinh độ drone hiện tại
+            heading: Hướng bay (yaw, độ). Mặc định 0.
         """
         if lat == 0.0 and lon == 0.0:
             return  # Không có GPS fix
 
         self._drone_lat = lat
         self._drone_lon = lon
+        self._drone_heading = heading
 
-        # Thêm vào path tracking
-        self._drone_path.append((lat, lon))
-
-        # Giới hạn path length để tránh tốn bộ nhớ (giữ 500 điểm cuối)
-        if len(self._drone_path) > 500:
-            self._drone_path = self._drone_path[-500:]
+        # Cập nhật drone marker trên bản đồ (chỉ gọi JS, không reload)
+        self._js_update_drone()
 
         # Cập nhật khoảng cách hiển thị
         self._update_distance_display()
@@ -659,6 +601,20 @@ class MissionTab(QWidget):
         self._home_lat = lat
         self._home_lon = lon
         self._has_home = True
+
+        # Cập nhật home marker trên bản đồ
+        self._js_update_home()
+
+    def update_telemetry(self, lat: float, lon: float, heading: float = 0.0):
+        """
+        Alias cho update_drone_position — tương thích với tên gọi trong spec.
+
+        Args:
+            lat: Vĩ độ
+            lon: Kinh độ
+            heading: Hướng bay (độ)
+        """
+        self.update_drone_position(lat, lon, heading)
 
     def _update_distance_display(self):
         """Cập nhật hiển thị khoảng cách drone → Home."""

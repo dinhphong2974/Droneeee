@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+    <!-- ═══════════════════════════════════════════════════════════
+         LEAFLET — Load từ file local (assets/leaflet/)
+         Không dùng CDN để tránh race condition + hoạt động offline
+         ═══════════════════════════════════════════════════════════ -->
+    <link rel="stylesheet" href="leaflet/leaflet.css"/>
+    <script src="leaflet/leaflet.js"></script>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         QWEBCHANNEL — Load từ Qt resource system (luôn có sẵn)
+         Cho phép JavaScript gọi Python Slot qua bridge object
+         ═══════════════════════════════════════════════════════════ -->
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+        }
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            left: 0;
+            right: 0;
+        }
+        /* Dark theme cho Leaflet controls */
+        .leaflet-control-zoom a {
+            background-color: #252540 !important;
+            color: #d0d0e8 !important;
+            border-color: #3a3a60 !important;
+        }
+        .leaflet-control-zoom a:hover {
+            background-color: #3a3a6a !important;
+        }
+        .leaflet-control-attribution {
+            background-color: rgba(26, 26, 46, 0.8) !important;
+            color: #808098 !important;
+            font-size: 10px !important;
+        }
+        .leaflet-control-attribution a {
+            color: #6c6cff !important;
+        }
+        /* Error overlay nếu Leaflet không load */
+        #error-overlay {
+            display: none;
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #1a1a2e;
+            color: #F44336;
+            font-family: 'Segoe UI', sans-serif;
+            font-size: 16px;
+            font-weight: bold;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="error-overlay">⚠️ Leaflet không load được. Kiểm tra thư mục assets/leaflet/</div>
+
+    <script>
+    // ═══════════════════════════════════════════════════════════════
+    // GLOBAL STATE — Python gọi các hàm này qua runJavaScript()
+    // ═══════════════════════════════════════════════════════════════
+
+    // Leaflet map instance
+    window.droneMap = null;
+
+    // Drone marker (vị trí hiện tại)
+    window.droneMarker = null;
+
+    // Home marker (vị trí ARM)
+    window.homeMarker = null;
+
+    // Waypoint markers array
+    window.wpMarkers = [];
+
+    // Waypoint labels (DivIcon numbers)
+    window.wpLabels = [];
+
+    // Mission route polyline (nét đứt cam nối waypoints)
+    window.missionLine = null;
+
+    // Flight path polyline (đường bay thực tế, xanh dương)
+    window.flightPath = null;
+
+    // Flight path points array
+    window._pathPoints = [];
+
+    // QWebChannel bridge reference (set trong init)
+    window._bridge = null;
+
+    // ═══════════════════════════════════════════════════════════════
+    // CUSTOM ICONS
+    // ═══════════════════════════════════════════════════════════════
+
+    // Drone icon — SVG inline (hướng bay xoay theo heading)
+    function _createDroneIcon(heading) {
+        return L.divIcon({
+            className: 'drone-icon',
+            html: '<div style="' +
+                'width: 36px; height: 36px; ' +
+                'transform: rotate(' + (heading || 0) + 'deg); ' +
+                'filter: drop-shadow(0 2px 4px rgba(0,0,0,0.5)); ' +
+                'display: flex; align-items: center; justify-content: center; ' +
+                'font-size: 28px;">' +
+                '🛸</div>',
+            iconSize: [36, 36],
+            iconAnchor: [18, 18]
+        });
+    }
+
+    // Home icon
+    var _homeIcon = null;
+    function _getHomeIcon() {
+        if (!_homeIcon) {
+            _homeIcon = L.divIcon({
+                className: 'home-icon',
+                html: '<div style="' +
+                    'width: 32px; height: 32px; ' +
+                    'background: #4CAF50; ' +
+                    'border: 3px solid white; ' +
+                    'border-radius: 50%; ' +
+                    'display: flex; align-items: center; justify-content: center; ' +
+                    'font-size: 16px; ' +
+                    'box-shadow: 0 2px 8px rgba(0,0,0,0.4);">' +
+                    '🏠</div>',
+                iconSize: [32, 32],
+                iconAnchor: [16, 16]
+            });
+        }
+        return _homeIcon;
+    }
+
+    // Waypoint icon (numbered)
+    function _createWpIcon(number) {
+        return L.divIcon({
+            className: 'wp-icon',
+            html: '<div style="' +
+                'background-color: #FF9800; ' +
+                'color: white; ' +
+                'border-radius: 50%; ' +
+                'width: 28px; height: 28px; ' +
+                'display: flex; align-items: center; justify-content: center; ' +
+                'font-weight: bold; font-size: 13px; ' +
+                'font-family: Segoe UI, sans-serif; ' +
+                'border: 2px solid white; ' +
+                'box-shadow: 0 2px 6px rgba(0,0,0,0.4);">' +
+                number + '</div>',
+            iconSize: [28, 28],
+            iconAnchor: [14, 14]
+        });
+    }
+
+
+    // ═══════════════════════════════════════════════════════════════
+    // INITIALIZATION — window.onload đảm bảo tất cả script đã load
+    // ═══════════════════════════════════════════════════════════════
+
+    window.onload = function() {
+        // ── Guard: Kiểm tra Leaflet có load thành công không ──
+        if (typeof L === 'undefined') {
+            document.getElementById('error-overlay').style.display = 'flex';
+            console.error('[DroneGCS] FATAL: Leaflet (L) is undefined. Check leaflet/leaflet.js path.');
+            return;
+        }
+
+        // ── Fix Leaflet icon path cho file:// protocol ──
+        // Khi load từ file://, Leaflet không tìm được images/ tự động
+        L.Icon.Default.prototype.options.imagePath = 'leaflet/images/';
+
+        // ── Tạo Leaflet map — tọa độ mặc định Hà Nội ──
+        window.droneMap = L.map('map', {
+            center: [21.0285, 105.8542],
+            zoom: 16,
+            zoomControl: true,
+            preferCanvas: false
+        });
+
+        // ── Tile layer — OpenStreetMap ──
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        }).addTo(window.droneMap);
+
+        // ── QWebChannel bridge setup ──
+        // qt.webChannelTransport được Qt inject vào page tự động
+        // khi QWebChannel đã được setWebChannel() ở Python side.
+        // QWebChannel constructor kết nối transport → lấy bridge object.
+        if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined') {
+            new QWebChannel(qt.webChannelTransport, function(channel) {
+                window._bridge = channel.objects.bridge;
+
+                // ── Map click → gửi tọa độ về Python qua bridge ──
+                window.droneMap.on('click', function(e) {
+                    if (window._bridge) {
+                        window._bridge.on_map_clicked(e.latlng.lat, e.latlng.lng);
+                    }
+                });
+
+                console.log('[DroneGCS] ✅ Map + QWebChannel initialized successfully');
+            });
+        } else {
+            console.warn('[DroneGCS] QWebChannel not available — map click disabled');
+            // Map vẫn hoạt động, chỉ không gửi click event về Python
+        }
+
+        console.log('[DroneGCS] ✅ Leaflet map created');
+    };
+
+
+    // ═══════════════════════════════════════════════════════════════
+    // GLOBAL FUNCTIONS — Python gọi qua runJavaScript()
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * updateDronePosition(lat, lng, heading)
+     *
+     * Tạo hoặc cập nhật vị trí drone marker trên bản đồ.
+     * - Nếu marker chưa tồn tại → tạo mới tại (lat, lng)
+     * - Nếu đã tồn tại → setLatLng + cập nhật icon (xoay heading)
+     * - KHÔNG reload page — chỉ thao tác DOM
+     *
+     * @param {number} lat     - Vĩ độ (decimal degrees)
+     * @param {number} lng     - Kinh độ (decimal degrees)
+     * @param {number} heading - Hướng bay (độ, 0-360). Mặc định 0.
+     */
+    function updateDronePosition(lat, lng, heading) {
+        if (!window.droneMap) return;
+        heading = heading || 0;
+
+        if (window.droneMarker) {
+            // Cập nhật vị trí + xoay icon
+            window.droneMarker.setLatLng([lat, lng]);
+            window.droneMarker.setIcon(_createDroneIcon(heading));
+        } else {
+            // Tạo marker mới
+            window.droneMarker = L.marker([lat, lng], {
+                icon: _createDroneIcon(heading),
+                zIndexOffset: 1000  // Drone luôn trên cùng
+            }).addTo(window.droneMap);
+            window.droneMarker.bindTooltip('Drone', {
+                permanent: false,
+                direction: 'top',
+                offset: [0, -20]
+            });
+        }
+
+        // ── Thêm điểm vào flight path tracking ──
+        window._pathPoints.push([lat, lng]);
+
+        // Giới hạn path length (500 điểm cuối)
+        if (window._pathPoints.length > 500) {
+            window._pathPoints = window._pathPoints.slice(-500);
+        }
+
+        // Cập nhật hoặc tạo flight path polyline
+        if (window.flightPath) {
+            window.flightPath.setLatLngs(window._pathPoints);
+        } else if (window._pathPoints.length >= 2) {
+            window.flightPath = L.polyline(window._pathPoints, {
+                color: '#2196F3',
+                weight: 2,
+                opacity: 0.7
+            }).addTo(window.droneMap);
+        }
+    }
+
+    /**
+     * updateHomePosition(lat, lng)
+     *
+     * Đặt hoặc cập nhật Home marker (vị trí chốt khi ARM).
+     *
+     * @param {number} lat - Vĩ độ
+     * @param {number} lng - Kinh độ
+     */
+    function updateHomePosition(lat, lng) {
+        if (!window.droneMap) return;
+
+        if (window.homeMarker) {
+            window.homeMarker.setLatLng([lat, lng]);
+        } else {
+            window.homeMarker = L.marker([lat, lng], {
+                icon: _getHomeIcon(),
+                zIndexOffset: 500
+            }).addTo(window.droneMap);
+            window.homeMarker.bindTooltip('HOME', {
+                permanent: true,
+                direction: 'bottom',
+                offset: [0, 16],
+                className: 'home-tooltip'
+            });
+        }
+    }
+
+    /**
+     * updateWaypoints(waypointsJson)
+     *
+     * Vẽ lại toàn bộ waypoint markers + mission route polyline.
+     * Xóa markers cũ trước khi vẽ mới — gọi khi danh sách WP thay đổi.
+     *
+     * @param {string} waypointsJson - JSON string: [{"lat":..., "lon":..., "alt":...}, ...]
+     */
+    function updateWaypoints(waypointsJson) {
+        if (!window.droneMap) return;
+
+        var waypoints;
+        try {
+            waypoints = JSON.parse(waypointsJson);
+        } catch(e) {
+            console.error('[DroneGCS] Invalid waypoints JSON:', e);
+            return;
+        }
+
+        // ── Xóa markers cũ ──
+        for (var i = 0; i < window.wpMarkers.length; i++) {
+            window.droneMap.removeLayer(window.wpMarkers[i]);
+        }
+        window.wpMarkers = [];
+
+        // ── Xóa mission route cũ ──
+        if (window.missionLine) {
+            window.droneMap.removeLayer(window.missionLine);
+            window.missionLine = null;
+        }
+
+        // ── Tạo markers mới ──
+        var coords = [];
+        for (var j = 0; j < waypoints.length; j++) {
+            var wp = waypoints[j];
+            var marker = L.marker([wp.lat, wp.lon], {
+                icon: _createWpIcon(j + 1),
+                zIndexOffset: 200
+            }).addTo(window.droneMap);
+            marker.bindPopup('WP ' + (j + 1) + ': Alt ' + wp.alt + 'm');
+            marker.bindTooltip('Waypoint ' + (j + 1), {
+                permanent: false,
+                direction: 'top',
+                offset: [0, -16]
+            });
+            window.wpMarkers.push(marker);
+            coords.push([wp.lat, wp.lon]);
+        }
+
+        // ── Vẽ mission route (nét đứt cam) ──
+        if (coords.length >= 2) {
+            window.missionLine = L.polyline(coords, {
+                color: '#FF9800',
+                weight: 3,
+                opacity: 0.8,
+                dashArray: '10, 8'
+            }).addTo(window.droneMap);
+        }
+    }
+
+    /**
+     * updateMissionPath(pointsJson)
+     *
+     * Vẽ hoặc cập nhật đường bay mission (polyline xanh dương).
+     * Khác với flight path tracking — đây là route preview.
+     *
+     * @param {string} pointsJson - JSON string: [[lat, lng], [lat, lng], ...]
+     */
+    function updateMissionPath(pointsJson) {
+        if (!window.droneMap) return;
+
+        var points;
+        try {
+            points = JSON.parse(pointsJson);
+        } catch(e) {
+            console.error('[DroneGCS] Invalid path JSON:', e);
+            return;
+        }
+
+        if (window.flightPath) {
+            window.flightPath.setLatLngs(points);
+        } else if (points.length >= 2) {
+            window.flightPath = L.polyline(points, {
+                color: '#2196F3',
+                weight: 2,
+                opacity: 0.7
+            }).addTo(window.droneMap);
+        }
+    }
+
+    /**
+     * setMapView(lat, lng, zoom)
+     *
+     * Di chuyển bản đồ tới vị trí mới.
+     *
+     * @param {number} lat  - Vĩ độ
+     * @param {number} lng  - Kinh độ
+     * @param {number} zoom - Mức zoom (tùy chọn, mặc định giữ nguyên)
+     */
+    function setMapView(lat, lng, zoom) {
+        if (!window.droneMap) return;
+        if (typeof zoom === 'number' && zoom > 0) {
+            window.droneMap.setView([lat, lng], zoom);
+        } else {
+            window.droneMap.panTo([lat, lng]);
+        }
+    }
+
+    /**
+     * clearFlightPath()
+     *
+     * Xóa toàn bộ đường bay tracking (reset khi disconnect hoặc disarm).
+     */
+    function clearFlightPath() {
+        if (window.flightPath && window.droneMap) {
+            window.droneMap.removeLayer(window.flightPath);
+            window.flightPath = null;
+        }
+        window._pathPoints = [];
+    }
+
+    /**
+     * clearAll()
+     *
+     * Reset toàn bộ markers và polylines. Gọi khi disconnect.
+     */
+    function clearAll() {
+        // Xóa drone marker
+        if (window.droneMarker && window.droneMap) {
+            window.droneMap.removeLayer(window.droneMarker);
+            window.droneMarker = null;
+        }
+        // Xóa home marker
+        if (window.homeMarker && window.droneMap) {
+            window.droneMap.removeLayer(window.homeMarker);
+            window.homeMarker = null;
+        }
+        // Xóa waypoints
+        updateWaypoints('[]');
+        // Xóa flight path
+        clearFlightPath();
+    }
+
+    </script>
+</body>
+</html>

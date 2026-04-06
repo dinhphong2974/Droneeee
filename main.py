@@ -25,7 +25,6 @@ import sys
 from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout,
                                 QHBoxLayout, QLineEdit, QPushButton, QLabel,
                                 QMessageBox, QDoubleSpinBox)
-from PySide6.QtCore import QTimer
 from ui.main_window import MainWindow
 from ui.emergency_overlay import EmergencyOverlay
 from comm.wifi_worker import WifiWorker
@@ -35,9 +34,6 @@ from core.flight_controller import FlightController
 # ── Thông số pin Lipo 6S ──
 LIPO_6S_MIN_VOLTAGE = 19.8  # Điện áp rỗng (V)
 LIPO_6S_MAX_VOLTAGE = 25.2  # Điện áp đầy (V)
-
-# ── Chu kỳ cập nhật bản đồ (để tránh reload quá thường xuyên) ──
-MAP_REFRESH_INTERVAL_MS = 3000  # 3 giây
 
 
 class ConnectionDialog(QDialog):
@@ -248,11 +244,6 @@ class GCSApp(MainWindow):
         mt.btn_start_mission_tab.clicked.connect(self._start_mission)
         mt.btn_stop_mission.clicked.connect(self._stop_mission)
 
-        # ── Timer cập nhật bản đồ (không refresh quá thường xuyên) ──
-        self._map_refresh_timer = QTimer(self)
-        self._map_refresh_timer.timeout.connect(self._refresh_mission_map)
-        self._map_refresh_pending = False
-
         # ── Cờ cảnh báo khoảng cách (tránh hiện dialog lặp) ──
         self._distance_warning_shown = False
 
@@ -274,7 +265,6 @@ class GCSApp(MainWindow):
             self.drone_state.reset()
             self.set_ui_state_na()
             self.emergency_overlay.hide_overlay()
-            self._map_refresh_timer.stop()
             self.setWindowTitle("Drone Ground Station - Đã ngắt kết nối")
             QMessageBox.information(self, "Thông báo", "Đã ngắt kết nối với thiết bị an toàn.")
         else:
@@ -301,8 +291,6 @@ class GCSApp(MainWindow):
         # Khởi chạy thread ngầm
         self.worker.start()
 
-        # Khởi động timer cập nhật bản đồ
-        self._map_refresh_timer.start(MAP_REFRESH_INTERVAL_MS)
         self._distance_warning_shown = False
 
     # ══════════════════════════════════════════════
@@ -323,7 +311,6 @@ class GCSApp(MainWindow):
             self.drone_state.reset()
             self.set_ui_state_na()
             self.emergency_overlay.hide_overlay()
-            self._map_refresh_timer.stop()
             self.setWindowTitle("Drone Ground Station - Mất kết nối")
             QMessageBox.warning(self, "Cảnh báo Mạng", message)
 
@@ -461,13 +448,13 @@ class GCSApp(MainWindow):
         if "gps_altitude" in data:
             self.drone_state.gps_altitude = data["gps_altitude"]
 
-        # ── Cập nhật vị trí drone trên bản đồ mission ──
+        # ── Cập nhật vị trí drone trên bản đồ mission (real-time, no reload) ──
         if "latitude" in data and "longitude" in data:
             lat = data["latitude"]
             lon = data["longitude"]
+            heading = self.drone_state.yaw  # Heading từ MSP_ATTITUDE
             if lat != 0.0 or lon != 0.0:
-                self.mission_tab.update_drone_position(lat, lon)
-                self._map_refresh_pending = True
+                self.mission_tab.update_drone_position(lat, lon, heading)
 
                 # Kiểm tra cảnh báo khoảng cách
                 self._check_distance_safety()
@@ -536,7 +523,6 @@ class GCSApp(MainWindow):
             self.flight_controller.abort()
         if self.worker:
             self.worker.stop()
-        self._map_refresh_timer.stop()
         event.accept()
 
     def resizeEvent(self, event):
@@ -757,11 +743,7 @@ class GCSApp(MainWindow):
                 self.mission_tab.val_failsafe_status.setText("RTH — Auto Failsafe")
                 self.mission_tab.val_failsafe_status.setStyleSheet("color: #F44336; font-weight: bold;")
 
-    def _refresh_mission_map(self):
-        """Timer callback — cập nhật bản đồ nếu có dữ liệu mới."""
-        if self._map_refresh_pending:
-            self.mission_tab.refresh_map()
-            self._map_refresh_pending = False
+
 
 
 # ══════════════════════════════════════════════════
