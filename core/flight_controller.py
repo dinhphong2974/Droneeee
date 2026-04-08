@@ -22,7 +22,6 @@ KHÔNG truy cập trực tiếp socket hay widget UI.
 """
 
 import time
-import struct
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from comm.msp_parser import MSPParser, MSP_SET_RAW_RC, MSP_SET_WP
@@ -592,11 +591,14 @@ class FlightController(QObject):
     # ══════════════════════════════════════════════
 
     def _send_rc(self):
-        """Gửi MSP_SET_RAW_RC với giá trị kênh hiện tại qua WifiWorker."""
+        """Gửi MSP_SET_RAW_RC với giá trị kênh hiện tại qua WifiWorker.
+
+        ★ TASK-14: Dùng pack_set_raw_rc() thay vì tự pack — đảm bảo
+        PWM được clamp trong khoảng 1000-2000μs trước khi gửi.
+        """
         if not self._worker:
             return
-        payload = struct.pack('<8H', *self._channels)
-        frame = self._parser.pack_msg(MSP_SET_RAW_RC, payload)
+        frame = self._parser.pack_set_raw_rc(self._channels)
         self._worker.send_command(frame)
 
     def _safe_channels(self) -> list[int]:

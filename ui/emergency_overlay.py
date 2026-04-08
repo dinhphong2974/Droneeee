@@ -13,7 +13,7 @@ Thiết kế: Semi-transparent, glassmorphism, fade-in/out animation.
 from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Property
 from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QGraphicsOpacityEffect
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
 )
 
 
@@ -46,15 +46,17 @@ class EmergencyOverlay(QWidget):
         # Thay vào đó dùng raise_() để đưa lên trên cùng
         self.setAttribute(Qt.WA_TranslucentBackground, False)
 
-        # ── Hiệu ứng mờ dần (opacity effect) cho animation ──
-        self._opacity_effect = QGraphicsOpacityEffect(self)
-        self._opacity_effect.setOpacity(0.0)
-        self.setGraphicsEffect(self._opacity_effect)
+        # ── Opacity nội bộ (KHÔNG dùng QGraphicsOpacityEffect vì nó chặn
+        #    mouse event của các widget con — QPushButton sẽ không nhận click) ──
+        self._current_opacity = 0.0
 
         # ── Animation fade-in/out ──
-        self._fade_anim = QPropertyAnimation(self._opacity_effect, b"opacity")
+        # Animate property "overlayOpacity" (custom property) thay vì QGraphicsOpacityEffect
+        self._fade_anim = QPropertyAnimation(self, b"overlayOpacity")
         self._fade_anim.setDuration(300)  # 300ms
         self._fade_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        # Kết nối finished 1 lần duy nhất — tránh tích lũy connections (TASK-22)
+        self._fade_anim.finished.connect(self._on_fade_finished)
 
         # ── Xây dựng UI ──
         self._setup_ui()
@@ -142,6 +144,33 @@ class EmergencyOverlay(QWidget):
     # API CÔNG KHAI
     # ══════════════════════════════════════════════
 
+    # ── Custom property cho animation (thay thế QGraphicsOpacityEffect) ──
+
+    def _get_overlay_opacity(self):
+        return self._current_opacity
+
+    def _set_overlay_opacity(self, value):
+        self._current_opacity = value
+        self._apply_opacity()
+
+    overlayOpacity = Property(float, _get_overlay_opacity, _set_overlay_opacity)
+
+    def _apply_opacity(self):
+        """Cập nhật opacity qua stylesheet — KHÔNG dùng QGraphicsOpacityEffect.
+
+        Cách này giữ nguyên khả năng nhận click của các QPushButton con.
+        Chỉ thay đổi background opacity của container.
+        """
+        alpha = int(self._current_opacity * 230)  # Max alpha 230/255 (semi-transparent)
+        border_alpha = int(self._current_opacity * 150)
+        self.setStyleSheet(f"""
+            EmergencyOverlay {{
+                background-color: rgba(20, 20, 42, {alpha});
+                border: 2px solid rgba(255, 80, 80, {border_alpha});
+                border-radius: 12px;
+            }}
+        """)
+
     def show_with_mode(self, mode_name: str):
         """
         Hiển thị overlay với tên mode bay đang chạy.
@@ -164,23 +193,20 @@ class EmergencyOverlay(QWidget):
 
         # Animation fade-in
         self._fade_anim.stop()
-        self._fade_anim.setStartValue(self._opacity_effect.opacity())
+        self._fade_anim.setStartValue(self._current_opacity)
         self._fade_anim.setEndValue(0.95)
         self._fade_anim.start()
 
     def hide_overlay(self):
         """Ẩn overlay với animation fade-out."""
-        # Animation fade-out
         self._fade_anim.stop()
-        self._fade_anim.setStartValue(self._opacity_effect.opacity())
+        self._fade_anim.setStartValue(self._current_opacity)
         self._fade_anim.setEndValue(0.0)
-        self._fade_anim.finished.connect(self._on_fade_out_done)
         self._fade_anim.start()
 
-    def _on_fade_out_done(self):
-        """Callback khi animation fade-out kết thúc — ẩn widget."""
-        self._fade_anim.finished.disconnect(self._on_fade_out_done)
-        if self._opacity_effect.opacity() < 0.05:
+    def _on_fade_finished(self):
+        """Callback duy nhất khi bất kỳ animation nào kết thúc."""
+        if self._current_opacity < 0.05:
             self.hide()
 
     def _update_position(self):

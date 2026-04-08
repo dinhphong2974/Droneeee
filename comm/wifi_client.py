@@ -50,6 +50,8 @@ class WifiClient:
             OSError: Khi có lỗi hệ thống mạng.
         """
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # ★ TASK-11: Tắt Nagle's Algorithm — giảm latency ~40ms cho frame MSP nhỏ
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.settimeout(self.DEFAULT_TIMEOUT)
         self._sock.connect((self.ip, self.port))
 

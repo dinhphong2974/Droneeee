@@ -61,17 +61,23 @@ class ManualControlTab(QWidget):
         layout.addStretch()
 
     def _create_rc_sliders(self):
-        """Tạo 6 slider RC: Throttle, Roll, Pitch, Yaw, AUX1, AUX2."""
+        """Tạo 8 slider RC: Throttle, Roll, Pitch, Yaw, AUX1, AUX2, AUX3, AUX4.
+
+        ★ TASK-20: Thêm AUX3 (Safe Land) và AUX4 (RTH) để điều khiển
+        đầy đủ 8 kênh RC theo thứ tự AETR của INAV.
+        """
         self.grp_rc_sliders = QGroupBox("RC Channels")
         grid = QGridLayout(self.grp_rc_sliders)
 
         slider_configs = [
-            ("lbl_throttle",    "Throttle", "slider_throttle", "val_throttle",    1000, 2000, 1000, 0),
-            ("lbl_roll_input",  "Roll",     "slider_roll",     "val_roll_input",  1000, 2000, 1500, 1),
-            ("lbl_pitch_input", "Pitch",    "slider_pitch",    "val_pitch_input", 1000, 2000, 1500, 2),
-            ("lbl_yaw_input",   "Yaw",      "slider_yaw",      "val_yaw_input",   1000, 2000, 1500, 3),
-            ("lbl_aux1",        "AUX1",     "slider_aux1",     "val_aux1",        1000, 2000, 1000, 4),
-            ("lbl_aux2",        "AUX2",     "slider_aux2",     "val_aux2",        1000, 2000, 1000, 5),
+            ("lbl_throttle",    "Throttle",           "slider_throttle", "val_throttle",    1000, 2000, 1000, 0),
+            ("lbl_roll_input",  "Roll",                "slider_roll",     "val_roll_input",  1000, 2000, 1500, 1),
+            ("lbl_pitch_input", "Pitch",               "slider_pitch",    "val_pitch_input", 1000, 2000, 1500, 2),
+            ("lbl_yaw_input",   "Yaw",                 "slider_yaw",      "val_yaw_input",   1000, 2000, 1500, 3),
+            ("lbl_aux1",        "AUX1 (ARM)",          "slider_aux1",     "val_aux1",        1000, 2000, 1000, 4),
+            ("lbl_aux2",        "AUX2 (Mode)",         "slider_aux2",     "val_aux2",        1000, 2000, 1000, 5),
+            ("lbl_aux3",        "AUX3 (Safe Land)",    "slider_aux3",     "val_aux3",        1000, 2000, 1000, 6),
+            ("lbl_aux4",        "AUX4 (RTH)",          "slider_aux4",     "val_aux4",        1000, 2000, 1000, 7),
         ]
 
         for lbl_name, lbl_text, slider_name, val_name, min_v, max_v, default, row in slider_configs:
@@ -89,6 +95,10 @@ class ManualControlTab(QWidget):
             val = QLabel(str(default))
             setattr(self, val_name, val)
             grid.addWidget(val, row, 2)
+
+            # Kết nối valueChanged để cập nhật label realtime
+            val_ref = val  # capture reference cho closure
+            slider.valueChanged.connect(lambda v, vr=val_ref: vr.setText(str(v)))
 
     def _create_command_buttons(self):
         """Tạo nhóm nút lệnh bay."""

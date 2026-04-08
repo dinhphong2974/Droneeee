@@ -196,20 +196,31 @@ class Attitude3DWidget(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        if self.panda_engine is None:
-            try:
-                win_id = int(self.winId())
-                self.panda_engine = Panda3DEngine(
-                    parent_hwnd=win_id,
-                    width=self.width(),
-                    height=self.height(),
-                    model_path=self.model_path
-                )
-                self.timer.start(16)
-            except Exception as e:
-                print(f"[Attitude3DWidget] Lỗi khởi tạo Panda3D: {e}")
-                print(f"[Attitude3DWidget] Model path: {self.model_path}")
-                self.panda_engine = None
+        if self.panda_engine is None and not hasattr(self, '_init_scheduled'):
+            # ── Delay Panda3D init để QWebEngine kịp tạo GPU shared context ──
+            # Panda3D chiếm wglGraphicsPipe ngay khi ShowBase.__init__() chạy,
+            # khiến Chromium (QWebEngine) không tạo được GLES context → map fail.
+            # Delay 1 giây cho QWebEngine tải xong map.html trước.
+            self._init_scheduled = True
+            QTimer.singleShot(1000, self._deferred_init_panda)
+
+    def _deferred_init_panda(self):
+        """Khởi tạo Panda3D engine sau khi QWebEngine đã sẵn sàng."""
+        if self.panda_engine is not None:
+            return
+        try:
+            win_id = int(self.winId())
+            self.panda_engine = Panda3DEngine(
+                parent_hwnd=win_id,
+                width=self.width(),
+                height=self.height(),
+                model_path=self.model_path
+            )
+            self.timer.start(16)
+        except Exception as e:
+            print(f"[Attitude3DWidget] Lỗi khởi tạo Panda3D: {e}")
+            print(f"[Attitude3DWidget] Model path: {self.model_path}")
+            self.panda_engine = None
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

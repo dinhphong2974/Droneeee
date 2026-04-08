@@ -68,7 +68,8 @@ class WifiWorker(QThread):
         self._parser = MSPParser()
 
         # Queue nhận lệnh từ UI thread (thread-safe)
-        self._command_queue: Queue = Queue()
+        # ★ TASK-10: Giới hạn 10 lệnh — tránh tích lũy vô hạn khi mất kết nối
+        self._command_queue: Queue = Queue(maxsize=10)
 
         # ── Mock mode state ──
         self._mock_channels = [1500, 1500, 1000, 1500, 1000, 1500, 1000, 1000]
@@ -101,11 +102,18 @@ class WifiWorker(QThread):
         Được gọi từ FlightController (Main Thread).
         Worker thread sẽ lấy và gửi qua TCP ở vòng lặp tiếp theo.
 
+        ★ TASK-10: Nếu queue đầy, bỏ lệnh cũ nhất (drone chỉ cần lệnh mới nhất).
+
         Args:
             data: Frame MSP đã đóng gói (output của MSPParser.pack_msg)
                   hoặc lệnh cấu hình failsafe (VD: "FS:rth")
         """
-        self._command_queue.put(data)
+        if self._command_queue.full():
+            try:
+                self._command_queue.get_nowait()  # Bỏ lệnh cũ nhất
+            except Empty:
+                pass
+        self._command_queue.put_nowait(data)
 
     # ══════════════════════════════════════════════
     # CHẾ ĐỘ KẾT NỐI THẬT (ESP32 qua TCP)
@@ -161,12 +169,19 @@ class WifiWorker(QThread):
             self._close_connection()
 
     def _drain_command_queue(self):
-        """Lấy và gửi tất cả lệnh đang chờ trong hàng đợi qua TCP."""
-        while True:
+        """Lấy và gửi lệnh đang chờ trong hàng đợi qua TCP.
+
+        ★ TASK-10: Giới hạn 2 lệnh/vòng để tránh burst nhiều frame
+        liên tiếp gây nghẽn ESP32 UART buffer.
+        """
+        MAX_CMDS_PER_TICK = 2
+        sent = 0
+        while sent < MAX_CMDS_PER_TICK:
             try:
                 cmd_data = self._command_queue.get_nowait()
                 if self._client and self._client.is_connected:
                     self._client.send(cmd_data)
+                sent += 1
             except Empty:
                 break
 
@@ -319,6 +334,10 @@ class WifiWorker(QThread):
         """
         Dừng worker thread an toàn.
         Được gọi từ main.py khi người dùng bấm nút Ngắt Kết Nối.
+
+        ★ TASK-09: KHÔNG đóng socket từ Main Thread — để tránh race condition
+        với Worker Thread đang dùng socket. Worker thread sẽ tự dọn dẹp
+        trong finally block (line 160-161) khi is_running=False.
         """
         self.is_running = False
-        self._close_connection()
+        self.wait(3000)  # Chờ worker thread tự kết thúc tối đa 3s

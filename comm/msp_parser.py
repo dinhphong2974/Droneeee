@@ -55,6 +55,10 @@ GPS_COORD_SCALE = 10_000_000.0  # Hệ số chia tọa độ GPS (lat/lon x 10^7
 # ── Kích thước frame tối thiểu ──
 MIN_FRAME_SIZE = 6  # Header(3) + Size(1) + Cmd(1) + Checksum(1)
 
+# ── Giới hạn buffer parser — chống memory leak khi nhiễu sóng ──
+# ★ TASK-12: Nếu buffer vượt 4KB (không tìm thấy header $M>) thì cắt bớt
+MAX_BUFFER_SIZE = 4096
+
 
 class MSPParser:
     """
@@ -103,7 +107,7 @@ class MSPParser:
         """
         Đóng gói lệnh MSP_SET_RAW_RC gửi 8 kênh RC xuống Flight Controller.
 
-        Thứ tự kênh INAV: [Roll, Pitch, Yaw, Throttle, AUX1, AUX2, AUX3, AUX4]
+        Thứ tự kênh INAV: [Roll, Pitch, Throttle, Yaw, AUX1, AUX2, AUX3, AUX4]
         Mỗi kênh là uint16 LE, range 1000-2000μs.
 
         Args:
@@ -114,7 +118,9 @@ class MSPParser:
         """
         if len(channels) != 8:
             raise ValueError(f"Cần đúng 8 kênh RC, nhận được {len(channels)}")
-        payload = struct.pack('<8H', *channels)
+        # ★ TASK-13: Kẹp giá trị PWM trong khoảng an toàn 1000-2000μs
+        clamped = [max(1000, min(2000, ch)) for ch in channels]
+        payload = struct.pack('<8H', *clamped)
         return self.pack_msg(MSP_SET_RAW_RC, payload)
 
     def pack_set_wp(self, wp_no: int, lat: float, lon: float, alt_cm: int,
@@ -132,7 +138,7 @@ class MSPParser:
             alt_cm: Độ cao tương đối so với Home (cm)
             p1: Tham số 1 — Tốc độ (cm/s) hoặc thời gian dừng (giây)
             p2: Tham số 2 — Dự phòng
-            p3: Tham số 3 — Cờ đặc biệt (0x48 = flag cho WP cuối cùng)
+            p3: Tham số 3 — Cờ đặc biệt (0xA5 = flag cho WP cuối cùng theo INAV spec)
 
         Returns:
             bytes: Frame MSP hoàn chỉnh
@@ -141,7 +147,7 @@ class MSPParser:
         lat_int = int(lat * GPS_COORD_SCALE)
         lon_int = int(lon * GPS_COORD_SCALE)
 
-        # Đóng gói payload 21 bytes: wp_no(1) + action(1) + lat(4) + lon(4) + alt(4) + p1(2) + p2(2) + p3(2) + flag(1)
+        # Đóng gói payload 19 bytes: wp_no(1) + action(1) + lat(4) + lon(4) + alt(4) + p1(2) + p2(2) + p3(1)
         # Cấu trúc INAV MSP_SET_WP:
         # Byte 0: wp_no (uint8)
         # Byte 1: action (uint8) — 1=WAYPOINT, 4=RTH
@@ -182,6 +188,10 @@ class MSPParser:
                   Trả về dict rỗng nếu không có frame hợp lệ.
         """
         self.buffer.extend(data)
+
+        # ★ TASK-12: Chống tràn bộ nhớ — giữ lại 1KB cuối (có thể chứa frame đang dở)
+        if len(self.buffer) > MAX_BUFFER_SIZE:
+            self.buffer = self.buffer[-1024:]
         parsed_data = {}
 
         # Quét buffer tìm tất cả frame MSP response

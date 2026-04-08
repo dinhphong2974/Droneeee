@@ -237,6 +237,12 @@ class GCSApp(MainWindow):
         mc.btn_disarm.clicked.connect(self.flight_controller.disarm)
         mc.btn_takeoff_hold.clicked.connect(self._confirm_takeoff)
         mc.btn_rth.clicked.connect(self.flight_controller.rth)
+        # ★ TASK-18: Kết nối nút Send Manual — đọc tất cả slider và gửi RC
+        mc.btn_send_manual.clicked.connect(self._send_manual_rc)
+        # ★ TASK-19: Kết nối nút HOLD — kích hoạt ALTHOLD+POSHOLD giữ vị trí
+        mc.btn_hold.clicked.connect(self._hold_position)
+        # Kết nối Start Mission từ manual tab
+        mc.btn_start_mission_main.clicked.connect(self._start_mission)
 
         # ── Kết nối nút mission (từ MissionTab) ──
         mt = self.mission_tab
@@ -393,7 +399,11 @@ class GCSApp(MainWindow):
                     self.emergency_overlay.show_with_mode("Armed")
 
                 # Chốt Home position khi ARM lần đầu (read-only từ GPS)
-                if not self.drone_state.has_home and self.drone_state.latitude != 0.0:
+                # ★ TASK-16: Phải có 3D fix (gps_fix_type >= 2) để đảm bảo
+                # tọa độ chính xác — tránh RTH bay về vị trí sai
+                if (not self.drone_state.has_home
+                        and self.drone_state.latitude != 0.0
+                        and self.drone_state.gps_fix_type >= 2):
                     self.drone_state.home_lat = self.drone_state.latitude
                     self.drone_state.home_lon = self.drone_state.longitude
                     self.drone_state.has_home = True
@@ -614,13 +624,59 @@ class GCSApp(MainWindow):
     # ══════════════════════════════════════════════
 
     def _emergency_disarm(self):
-        """Nút DISARM khẩn cấp từ overlay — tắt motor lập tức."""
-        self.flight_controller.disarm()
+        """Nút DISARM khẩn cấp từ overlay — dừng state machine + tắt motor lập tức."""
+        self.flight_controller.abort()
         self.emergency_overlay.hide_overlay()
 
     def _emergency_safe_land(self):
         """Nút Safe Land khẩn cấp từ overlay — hạ cánh tại chỗ."""
         self.flight_controller.safe_land()
+
+    # ══════════════════════════════════════════════
+    # MANUAL RC CONTROL
+    # ══════════════════════════════════════════════
+
+    def _send_manual_rc(self):
+        """★ TASK-18: Đọc giá trị từ 8 slider và gửi MSP_SET_RAW_RC.
+
+        Thứ tự kênh AETR: [Roll, Pitch, Throttle, Yaw, AUX1, AUX2, AUX3, AUX4]
+        Các giá trị PWM đã được clamp 1000-2000 bởi slider limits + pack_set_raw_rc().
+        """
+        if not self.worker:
+            return
+
+        mc = self.manual_control_tab
+        channels = [
+            mc.slider_roll.value(),       # CH1: Roll
+            mc.slider_pitch.value(),      # CH2: Pitch
+            mc.slider_throttle.value(),   # CH3: Throttle
+            mc.slider_yaw.value(),        # CH4: Yaw
+            mc.slider_aux1.value(),       # CH5: AUX1 (ARM)
+            mc.slider_aux2.value(),       # CH6: AUX2 (Flight Mode)
+            mc.slider_aux3.value(),       # CH7: AUX3 (Safe Land)
+            mc.slider_aux4.value(),       # CH8: AUX4 (RTH)
+        ]
+        from comm.msp_parser import MSPParser
+        parser = MSPParser()
+        frame = parser.pack_set_raw_rc(channels)
+        self.worker.send_command(frame)
+
+    def _hold_position(self):
+        """★ TASK-19: Kích hoạt ALTHOLD+POSHOLD — giữ vị trí và độ cao hiện tại.
+
+        AUX2=2000 (CH6) bật đồng thời NAV ALTHOLD + NAV POSHOLD trên INAV.
+        FC sử dụng Baro + GPS BZ 251 để tự giữ vị trí.
+        """
+        if not self.worker:
+            return
+
+        from core.flight_controller import FlightController
+        fc = self.flight_controller
+        # Đảm bảo drone vẫn ARM + bật ALTHOLD+POSHOLD
+        fc._channels[fc.CH_AUX2] = fc.AUX_NAV_ALTHOLD_POSHOLD  # 2000
+        fc._channels[fc.CH_THROTTLE] = fc.RC_CENTER  # FC tự điều khiển
+        fc._send_rc()
+        fc.status_update.emit("HOLD — Giữ vị trí + độ cao (ALTHOLD+POSHOLD)")
 
     # ══════════════════════════════════════════════
     # MISSION LOGIC

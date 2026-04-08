@@ -62,5 +62,50 @@ class DroneState:
         self.active_mode_name: str = ""     # Tên mode đang chạy (ARM, Takeoff, Mission...)
 
     def reset(self):
-        """Reset toàn bộ trạng thái về mặc định (khi mất kết nối)."""
-        self.__init__()
+        """Reset toàn bộ trạng thái về mặc định (khi mất kết nối).
+
+        ★ TASK-17: Viết reset thủ công thay vì gọi self.__init__() để:
+        - Tránh stale reference nếu ai đó giữ ref cũ tới self.motors
+        - Tránh bug nếu __init__ được thêm tham số trong tương lai
+        - An toàn với sub-class override
+        """
+        # ── Từ MSP_ANALOG ──
+        self.voltage = 0.0
+        self.current = 0.0
+
+        # ── Từ MSP_ATTITUDE ──
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.yaw = 0.0
+
+        # ── Từ MSP_ALTITUDE ──
+        self.altitude = 0.0
+        self.vario = 0.0
+
+        # ── Từ MSP_STATUS ──
+        self.is_armed = False
+        self.flight_mode_flags = 0
+
+        # ── Từ MSP_MOTOR ──
+        self.motors[:] = [1000, 1000, 1000, 1000]  # In-place reset
+
+        # ── Từ MSP_RAW_GPS ──
+        self.gps_fix_type = 0
+        self.gps_num_sat = 0
+        self.latitude = 0.0
+        self.longitude = 0.0
+        self.gps_altitude = 0.0
+        self.ground_speed = 0.0
+        self.ground_course = 0.0
+        self.gps_hdop = 0.0
+
+        # ── Home ──
+        self.home_lat = 0.0
+        self.home_lon = 0.0
+        self.has_home = False
+
+        # ── Kết nối ──
+        self.is_connected = False
+
+        # ── Mode bay ──
+        self.active_mode_name = ""
