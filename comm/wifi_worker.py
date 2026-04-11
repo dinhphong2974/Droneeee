@@ -8,11 +8,13 @@ Module này điều phối giữa WifiClient (kết nối thô) và MSPParser (g
 4. Nhận lệnh từ UI thread qua command queue (thread-safe)
 
 Lệnh MSP polling:
+- MSP_SONAR_ALTITUDE (58): Độ cao bề mặt từ LiDAR MTF-02
 - MSP_ANALOG (110): Điện áp pin
 - MSP_ATTITUDE (108): Góc nghiêng
 - MSP_ALTITUDE (109): Độ cao barometer
 - MSP_STATUS (101): Trạng thái ARM
 - MSP_RAW_GPS (106): Tọa độ GPS BZ 251
+- MSP_STATUS_EX (150): Sensor health (OptFlow, LiDAR, Compass)
 
 KHÔNG chứa logic socket hay logic bóc tách gói tin.
 """
@@ -21,14 +23,15 @@ import time
 import struct
 import random
 import socket
-import math
+import threading
 from queue import Queue, Empty
 from PySide6.QtCore import QThread, Signal
 
 from comm.wifi_client import WifiClient
 from comm.msp_parser import (
     MSPParser, MSP_ANALOG, MSP_ATTITUDE, MSP_ALTITUDE, MSP_STATUS,
-    MSP_RAW_GPS, MSP_SET_RAW_RC, MSP_HEADER_REQUEST
+    MSP_RAW_GPS, MSP_SONAR_ALTITUDE, MSP_SET_RAW_RC, MSP_HEADER_REQUEST,
+    MSP_STATUS_EX
 )
 
 
@@ -70,6 +73,10 @@ class WifiWorker(QThread):
         # Queue nhận lệnh từ UI thread (thread-safe)
         self._command_queue: Queue = Queue()
 
+        # Emergency queue — ưu tiên cao nhất, được drain trước command_queue
+        self._emergency_queue: Queue = Queue()
+        self._emergency_abort = threading.Event()  # Cờ interrupt cho emergency
+
         # ── Mock mode state ──
         self._mock_channels = [1500, 1500, 1000, 1500, 1000, 1500, 1000, 1000]
         self._mock_armed = False
@@ -107,6 +114,29 @@ class WifiWorker(QThread):
         """
         self._command_queue.put(data)
 
+    def send_emergency_command(self, data: bytes):
+        """
+        Thread-safe: Gửi lệnh KHẨN CẤP — ưu tiên cao nhất.
+
+        Xóa toàn bộ command queue thường và đặt lệnh emergency lên đầu.
+        Được gọi từ FlightController.force_disarm() / force_safe_land().
+
+        Args:
+            data: Frame MSP khẩn cấp (DISARM / Safe Land)
+        """
+        # 1. Set cờ abort để interrupt bất kỳ blocking nào
+        self._emergency_abort.set()
+
+        # 2. Xóa tất cả lệnh thường trong queue (không còn cần thiết)
+        while not self._command_queue.empty():
+            try:
+                self._command_queue.get_nowait()
+            except Empty:
+                break
+
+        # 3. Đưa lệnh emergency vào priority queue
+        self._emergency_queue.put(data)
+
     # ══════════════════════════════════════════════
     # CHẾ ĐỘ KẾT NỐI THẬT (ESP32 qua TCP)
     # ══════════════════════════════════════════════
@@ -121,8 +151,12 @@ class WifiWorker(QThread):
             self.connection_status.emit(True, f"Đã kết nối Wifi với {self.ip}")
 
             # Danh sách các lệnh MSP sẽ hỏi FC luân phiên
-            # Thêm MSP_RAW_GPS để lấy tọa độ từ GPS BZ 251
-            cmds_to_request = [MSP_ANALOG, MSP_ATTITUDE, MSP_ALTITUDE, MSP_STATUS, MSP_RAW_GPS]
+            # Thêm MSP_SONAR_ALTITUDE để lấy độ cao LiDAR MTF-02
+            cmds_to_request = [
+                MSP_ANALOG, MSP_ATTITUDE, MSP_ALTITUDE,
+                MSP_STATUS, MSP_RAW_GPS, MSP_SONAR_ALTITUDE,
+                MSP_STATUS_EX  # Sensor health: OptFlow, LiDAR, Compass
+            ]
             cmd_index = 0
 
             # Bước 2: Vòng lặp hỏi-đáp liên tục
@@ -148,6 +182,10 @@ class WifiWorker(QThread):
 
                 except socket.timeout:
                     pass  # Bỏ qua nếu FC chưa kịp trả lời
+                except ConnectionAbortedError:
+                    # ESP32 chủ động đóng kết nối TCP
+                    self.connection_status.emit(False, "ESP32 đã ngắt kết nối")
+                    break
 
                 # Luân phiên hỏi lệnh tiếp theo
                 cmd_index = (cmd_index + 1) % len(cmds_to_request)
@@ -161,7 +199,20 @@ class WifiWorker(QThread):
             self._close_connection()
 
     def _drain_command_queue(self):
-        """Lấy và gửi tất cả lệnh đang chờ trong hàng đợi qua TCP."""
+        """Gửi lệnh: emergency queue trước, command queue sau."""
+        # Priority 1: Emergency commands (ưu tiên cao nhất)
+        while True:
+            try:
+                cmd_data = self._emergency_queue.get_nowait()
+                if self._client and self._client.is_connected:
+                    self._client.send(cmd_data)
+            except Empty:
+                break
+
+        # Reset emergency flag sau khi đã gửi hết
+        self._emergency_abort.clear()
+
+        # Priority 2: Normal commands
         while True:
             try:
                 cmd_data = self._command_queue.get_nowait()
@@ -205,7 +256,16 @@ class WifiWorker(QThread):
             throttle = self._mock_channels[2]
             motor_base = max(1000, int(throttle * 0.9 + 100)) if self._mock_armed else 1000
 
-            # Đóng gói và phát dữ liệu giả lên UI (telemetry + GPS)
+            # ── Giả lập LiDAR MTF-02 (surface altitude) ──
+            if self._mock_altitude <= 2.5 and self._mock_altitude > 0:
+                mock_surface_alt = self._mock_altitude + random.uniform(-0.02, 0.02)
+                mock_surface_alt = max(0.0, mock_surface_alt)
+                mock_surface_quality = 255
+            else:
+                mock_surface_alt = -1.0  # Ngoài tầm LiDAR
+                mock_surface_quality = 0
+
+            # Đóng gói và phát dữ liệu giả lên UI (telemetry + GPS + LiDAR)
             fake_data = {
                 "voltage": mock_volt,
                 "pitch": mock_pitch,
@@ -227,6 +287,9 @@ class WifiWorker(QThread):
                 "gps_altitude": self._mock_altitude,
                 "ground_speed": self._mock_gps_speed,
                 "ground_course": random.uniform(0, 360),
+                # ── LiDAR Data (MTF-02 giả lập) ──
+                "surface_altitude": mock_surface_alt,
+                "surface_quality": mock_surface_quality,
             }
             self.telemetry_data.emit(fake_data)
 
@@ -237,39 +300,55 @@ class WifiWorker(QThread):
 
     def _process_mock_commands(self):
         """Đọc lệnh từ hàng đợi và cập nhật trạng thái giả lập."""
-        while True:
-            try:
-                cmd_data = self._command_queue.get_nowait()
+        # Gộp cả emergency queue và command queue
+        all_queues = [self._emergency_queue, self._command_queue]
+        for queue in all_queues:
+            while True:
+                try:
+                    cmd_data = queue.get_nowait()
 
-                # Bỏ qua lệnh cấu hình failsafe (prefix FS:)
-                if isinstance(cmd_data, bytes) and cmd_data.startswith(b'FS:'):
-                    continue
+                    # Bỏ qua lệnh cấu hình failsafe (prefix FS:)
+                    if isinstance(cmd_data, bytes) and cmd_data.startswith(b'FS:'):
+                        continue
 
-                # Tìm frame MSP_SET_RAW_RC: $M< + size(16) + cmd(200) + payload(16B) + checksum
-                if (isinstance(cmd_data, bytes) and len(cmd_data) >= 22
-                        and cmd_data[0:3] == MSP_HEADER_REQUEST
-                        and cmd_data[4] == MSP_SET_RAW_RC):
-                    payload = cmd_data[5:21]
-                    channels = list(struct.unpack('<8H', payload))
-                    self._mock_channels = channels
-                    # AUX1 (index 4) > 1700 → ARM (dải kích hoạt: 2000)
-                    self._mock_armed = channels[4] > 1700
+                    # BUG-01 FIX: Strip prefix EM: (emergency marker) trước khi parse
+                    # force_disarm()/force_safe_land() gắn prefix này để ESP32 ưu tiên,
+                    # nhưng mock mode phải bóc prefix trước khi kiểm tra MSP header.
+                    if isinstance(cmd_data, bytes) and cmd_data.startswith(b'EM:'):
+                        cmd_data = cmd_data[3:]  # Bỏ 3 bytes 'EM:'
 
-                    # AUX3 (index 6) > 1700 → Safe Land giả lập
-                    if channels[6] > 1700 and self._mock_armed:
-                        # Giả lập hạ cánh: giảm altitude dần
-                        self._mock_altitude = max(0.0, self._mock_altitude - 0.3)
-                        if self._mock_altitude <= 0.1:
-                            self._mock_armed = False
-                            self._mock_altitude = 0.0
+                    # Tìm frame MSP_SET_RAW_RC: $M< + size(16) + cmd(200) + payload(16B) + checksum
+                    # BUG-01 FIX: Kiểm tra len trước struct.unpack để tránh crash
+                    if (isinstance(cmd_data, bytes)
+                            and len(cmd_data) >= 22
+                            and cmd_data[0:3] == MSP_HEADER_REQUEST
+                            and cmd_data[4] == MSP_SET_RAW_RC):
+                        payload = cmd_data[5:21]
+                        if len(payload) < 16:  # Guard: payload phải đủ 16 bytes
+                            continue
+                        channels = list(struct.unpack('<8H', payload))
+                        self._mock_channels = channels
+                        # AUX1 (index 4) > 1700 → ARM (dải kích hoạt: 2000)
+                        self._mock_armed = channels[4] > 1700
 
-                    # AUX4 (index 7) > 1700 → RTH giả lập
-                    if channels[7] > 1700 and self._mock_armed:
-                        # Giả lập RTH: di chuyển về home dần
-                        self._mock_gps_lat += (self._mock_home_lat - self._mock_gps_lat) * 0.05
-                        self._mock_gps_lon += (self._mock_home_lon - self._mock_gps_lon) * 0.05
-            except Empty:
-                break
+                        # AUX3 (index 6) > 1700 → Safe Land giả lập
+                        if channels[6] > 1700 and self._mock_armed:
+                            # Giả lập hạ cánh: giảm altitude dần
+                            self._mock_altitude = max(0.0, self._mock_altitude - 0.3)
+                            if self._mock_altitude <= 0.1:
+                                self._mock_armed = False
+                                self._mock_altitude = 0.0
+
+                        # AUX4 (index 7) > 1700 → RTH giả lập
+                        if channels[7] > 1700 and self._mock_armed:
+                            # Giả lập RTH: di chuyển về home dần
+                            self._mock_gps_lat += (self._mock_home_lat - self._mock_gps_lat) * 0.05
+                            self._mock_gps_lon += (self._mock_home_lon - self._mock_gps_lon) * 0.05
+                except Empty:
+                    break
+
+        # Reset emergency flag
+        self._emergency_abort.clear()
 
     def _update_mock_physics(self):
         """Giả lập vật lý: altitude thay đổi theo throttle khi armed."""
@@ -281,8 +360,15 @@ class WifiWorker(QThread):
         aux2_althold = self._mock_channels[5] > 1800  # ALTHOLD+POSHOLD: 2000
 
         if aux2_althold:
-            # ALTHOLD+POSHOLD mode: giữ altitude ổn định
-            self._mock_altitude += random.uniform(-0.05, 0.05)
+            # BUG-07 FIX: ALTHOLD+POSHOLD mode — mô phỏng INAV altitude hold behavior:
+            #   throttle > 1500 → leo (climb), = 1500 → giữ (hover), < 1500 → hạ
+            # Giống INAV ALTHOLD thực tế: 1700μs ≈ 2-3m/s climb rate
+            climb_rate = (throttle - 1500) / 1000.0  # Normalize: range ~-0.5 to +0.5 m/s per tick
+            if abs(climb_rate) < 0.02:  # Dead-band quanh center (±20μs)
+                # Hover: chỉ jitter nhỏ
+                self._mock_altitude += random.uniform(-0.02, 0.02)
+            else:
+                self._mock_altitude += climb_rate * 0.5  # Scale xuống cho mock (50ms tick)
             self._mock_altitude = max(0.0, self._mock_altitude)
         else:
             # Manual mode: altitude phụ thuộc throttle
@@ -319,6 +405,8 @@ class WifiWorker(QThread):
         """
         Dừng worker thread an toàn.
         Được gọi từ main.py khi người dùng bấm nút Ngắt Kết Nối.
+
+        Chỉ set cờ is_running = False, để thread tự dọn dẹp trong finally block.
+        Không gọi _close_connection() ở đây vì sẽ race condition với worker thread.
         """
         self.is_running = False
-        self._close_connection()

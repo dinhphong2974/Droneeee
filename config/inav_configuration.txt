@@ -1,0 +1,163 @@
+# ══════════════════════════════════════════════════════════════
+# INAV Configuration — DroneGCS NAV WP Takeoff + Sensor Health
+# ══════════════════════════════════════════════════════════════
+#
+# File này chứa các lệnh CLI cần chạy trong INAV Configurator
+# (tab CLI → Paste toàn bộ → Enter → save)
+#
+# Phiên bản INAV: 7.x+ (tương thích 6.x nhưng khuyến nghị 7.x)
+# Flight Controller: F405 / F722 / H743
+# Cảm biến: Micoair MTF-02 AIO (LiDAR + Optical Flow)
+# GPS: BN-251 (9600 baud, UART nối FC)
+# ESC Protocol: DShot600
+# ══════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────
+# 1. SENSOR CONFIGURATION — Micoair MTF-02 AIO
+# ─────────────────────────────────────────────────
+
+# Bật rangefinder (LiDAR) trên UART mà MTF-02 gắn vào
+# ⚠️ THAY ĐỔI: serial_port tùy theo cách bạn nối dây
+#   Ví dụ: serial 2 = UART3 trên nhiều FC F405
+#   Format: serial <index> <function> <baud> <baud> <baud> <baud>
+#   Function 8192 = MSP RANGEFINDER sensor
+#   Function 16384 = MSP OPFLOW sensor
+
+# Nếu MTF-02 nối vào UART3 (serial index 2):
+serial 2 8192 115200 57600 57600 57600
+
+# Bật rangefinder type = MTF-02 (type 4 trong INAV)
+set rangefinder_hardware = MTF01
+
+# Optical Flow hardware
+set opflow_hardware = MSP
+
+# ─────────────────────────────────────────────────
+# 2. NAVIGATION — Surface Control + NAV WP
+# ─────────────────────────────────────────────────
+
+# Surface control: AUTO = INAV tự chọn LiDAR hoặc Baro
+# Khi LiDAR trong tầm (0-2.5m) → dùng LiDAR
+# Khi LiDAR ngoài tầm → tự chuyển sang Barometer
+set nav_surface_control = AUTO
+
+# ── NAV WP (Waypoint Navigation) ──
+# Cho phép NAV WP takeoff tự động
+set nav_rth_allow_landing = ALWAYS
+set nav_wp_radius = 100
+set nav_wp_max_safe_distance = 10000
+set nav_auto_speed = 300
+set nav_auto_climb_rate = 200
+set nav_manual_speed = 500
+set nav_manual_climb_rate = 200
+
+# ── RTH (Return To Home) ──
+set nav_rth_altitude = 1000
+set nav_rth_climb_first = ON
+set nav_rth_alt_mode = AT_LEAST
+
+# ── ALTHOLD / POSHOLD ──
+set nav_mc_hover_thr = 1400
+set nav_use_midthr_for_althold = ON
+set nav_mc_pos_z_p = 50
+set nav_mc_pos_z_i = 30
+set nav_mc_pos_z_d = 10
+set nav_mc_vel_z_p = 100
+set nav_mc_vel_z_i = 50
+set nav_mc_vel_z_d = 10
+
+# ─────────────────────────────────────────────────
+# 3. GPS CONFIGURATION — BN-251
+# ─────────────────────────────────────────────────
+
+# GPS protocol (UBLOX cho BN-251)
+set gps_provider = UBLOX
+set gps_sbas_mode = AUTO
+set gps_dyn_model = AIR_1G
+set gps_auto_config = ON
+set gps_auto_baud = ON
+set gps_min_sats = 6
+
+# ─────────────────────────────────────────────────
+# 4. FAILSAFE CONFIGURATION
+# ─────────────────────────────────────────────────
+
+# Failsafe: Khi mất tín hiệu RC → RTH
+set failsafe_procedure = RTH
+set failsafe_delay = 10
+set failsafe_off_delay = 200
+set failsafe_throttle_low_delay = 100
+
+# Failsafe khi GPS yếu
+set failsafe_min_distance = 0
+set failsafe_min_distance_procedure = DROP
+
+# ─────────────────────────────────────────────────
+# 5. AUX MODES — Cấu hình kênh điều khiển
+# ────────────────────────────────────────────────
+#
+# ⚠️ QUAN TRỌNG: Phần này PHẢI cấu hình trong tab Modes
+# của INAV Configurator (GUI), KHÔNG chạy qua CLI.
+#
+# Bảng ánh xạ hiện tại (DroneGCS sử dụng):
+#
+# ┌─────────────┬─────────┬────────────┬────────────────────────┐
+# │ Chức năng   │ Kênh AUX│ Giá trị GCS│ Dải kích hoạt INAV     │
+# ├─────────────┼─────────┼────────────┼────────────────────────┤
+# │ ARM         │ AUX1/CH5│ 2000       │ 1700 - 2100            │
+# │ ALTHOLD     │ AUX2/CH6│ 2000       │ 1700 - 2100            │
+# │ POSHOLD     │ AUX2/CH6│ 2000       │ 1700 - 2100 (cùng AUX2)│
+# │ NAV WP      │ AUX2/CH6│ 2000       │ 1700 - 2100 (cùng AUX2)│
+# │ Safe Land(**)│ AUX3/CH7│ 2000      │ 1700 - 2100            │
+# │ RTH         │ AUX4/CH8│ 2000       │ 1700 - 2100            │
+# └─────────────┴─────────┴────────────┴────────────────────────┘
+#
+# ** Safe Land = tên logic trong GCS; trong INAV map tới
+#    FAILSAFE hoặc NAV LAND tùy cấu hình.
+#
+# ▶ HƯỚNG DẪN CẤU HÌNH TRONG INAV CONFIGURATOR:
+#   1. Mở tab Modes
+#   2. ARM → AUX1 → Kéo thanh giá trị: 1700~2100
+#   3. NAV ALTHOLD → AUX2 → Kéo thanh: 1700~2100
+#   4. NAV POSHOLD → AUX2 → Kéo thanh: 1700~2100
+#   5. NAV WP → AUX2 → Kéo thanh: 1700~2100  ← MỚI
+#   6. FAILSAFE → AUX3 → Kéo thanh: 1700~2100
+#   7. NAV RTH → AUX4 → Kéo thanh: 1700~2100
+#   8. Click "Save"
+#
+# ⚠️ NOTE: NAV WP, ALTHOLD, POSHOLD cùng AUX2 = 2000
+# INAV sẽ tự ưu tiên: NAV WP > POSHOLD > ALTHOLD
+# Khi có WP mission → INAV bay theo WP
+# Khi không có WP → INAV giữ ALTHOLD + POSHOLD
+#
+
+# ─────────────────────────────────────────────────
+# 6. MSP OVER WIFI — ESP32 Bridge Settings
+# ─────────────────────────────────────────────────
+
+# Bật MSP trên UART nối ESP32
+# ⚠️ THAY ĐỔI: serial_port tùy theo cách nối dây ESP32
+# Ví dụ: serial 0 = UART1 (TX1/RX1 trên FC)
+serial 0 64 115200 57600 57600 57600
+
+# Tóm tắt serial ports:
+# serial 0 = UART1 → ESP32 (MSP bridge, function 64)
+# serial 2 = UART3 → MTF-02 AIO (Rangefinder, function 8192)
+# serial 3 = UART4 → GPS BN-251 (auto-detected)
+
+# ─────────────────────────────────────────────────
+# 7. MOTOR / ESC CONFIGURATION
+# ─────────────────────────────────────────────────
+
+set motor_pwm_protocol = DSHOT600
+set dshot_beeper = OFF
+set motor_poles = 12
+set min_throttle = 1050
+set max_throttle = 2000
+
+# ─────────────────────────────────────────────────
+# 8. LƯU CẤU HÌNH
+# ─────────────────────────────────────────────────
+
+# Sau khi paste xong tất cả ở trên, chạy lệnh:
+save

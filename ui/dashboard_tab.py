@@ -1,9 +1,9 @@
 """
-dashboard_tab.py - Tab giám sát chính: Attitude 3D + Telemetry + Motors.
+dashboard_tab.py - Tab giám sát chính: Attitude 3D + Telemetry + Sensors + Motors.
 
 Chứa class DashboardTab(QWidget) bao gồm:
 - Bên trái (65%): Widget mô phỏng tư thế drone (Artificial Horizon)
-- Bên phải (35%): Bảng Telemetry + Bảng Motors
+- Bên phải (35%): Bảng Telemetry + Sensor Health + Bảng Motors
 """
 
 from PySide6.QtCore import Qt
@@ -26,7 +26,7 @@ class DashboardTab(QWidget):
         self._setup_ui()
 
     def _setup_ui(self):
-        """Xây dựng layout: Attitude 3D (65%) | Telemetry + Motors (35%)."""
+        """Xây dựng layout: Attitude 3D (65%) | Telemetry + Sensors + Motors (35%)."""
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -37,13 +37,16 @@ class DashboardTab(QWidget):
         self.widget_3d_attitude = Attitude3DWidget()
         splitter.addWidget(self.widget_3d_attitude)
 
-        # ── BÊN PHẢI: Telemetry + Motors (35%) ──
+        # ── BÊN PHẢI: Telemetry + Sensor Health + Motors (35%) ──
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(4, 4, 4, 4)
 
         self._create_telemetry_group()
         right_layout.addWidget(self.grp_telemetry)
+
+        self._create_sensor_health_group()
+        right_layout.addWidget(self.grp_sensor_health)
 
         self._create_motors_group()
         right_layout.addWidget(self.grp_motors)
@@ -89,15 +92,18 @@ class DashboardTab(QWidget):
         grid.addWidget(self.grp_gps_coords, row, 0, 1, 2)
         row += 1
 
-        # ── Cột phải: Attitude + GPS Fix ──
+        # ── Cột phải: Attitude + GPS Fix + Sensors ──
         row_r = 0
         fields_right = [
-            ("lbl_roll",    "Roll",         "val_roll"),
-            ("lbl_pitch",   "Pitch",        "val_pitch"),
-            ("lbl_yaw",     "Yaw",          "val_yaw"),
-            ("lbl_gps_fix", "GPS Fix",      "val_gps_fix"),
-            ("lbl_sats",    "Satellites",   "val_sats"),
-            ("lbl_spd",     "Ground Speed", "val_spd"),
+            ("lbl_roll",        "Roll",         "val_roll"),
+            ("lbl_pitch",       "Pitch",        "val_pitch"),
+            ("lbl_yaw",         "Yaw",          "val_yaw"),
+            ("lbl_gps_fix",     "GPS Fix",      "val_gps_fix"),
+            ("lbl_sats",        "🛰 Satellites","val_sats"),
+            ("lbl_spd",         "Ground Speed", "val_spd"),
+            ("lbl_surface_alt", "📡 Surface Alt","val_surface_alt"),
+            ("lbl_lidar_qual",  "LiDAR Quality","val_lidar_qual"),
+            ("lbl_opflow",      "👁 Optical Flow","val_opflow"),
         ]
         for lbl_name, lbl_text, val_name in fields_right:
             lbl = QLabel(lbl_text)
@@ -125,6 +131,73 @@ class DashboardTab(QWidget):
         self.val_lon.setFont(self._bold_font)
         grid.addWidget(self.lbl_lon, 0, 2)
         grid.addWidget(self.val_lon, 0, 3)
+
+    # ══════════════════════════════════════════════
+    # SENSOR HEALTH CARD
+    # ══════════════════════════════════════════════
+
+    def _create_sensor_health_group(self):
+        """Tạo bảng trạng thái cảm biến: GPS, LiDAR, OptFlow, Compass."""
+        self.grp_sensor_health = QGroupBox("Sensor Health")
+        self.grp_sensor_health.setStyleSheet("""
+            QGroupBox {
+                border: 1px solid #2a3a5a;
+                border-radius: 8px;
+                margin-top: 14px;
+                padding-top: 18px;
+                font-weight: bold;
+                color: #80a0d8;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+            }
+        """)
+        grid = QGridLayout(self.grp_sensor_health)
+        grid.setSpacing(8)
+
+        sensors = [
+            ("🛰", "GPS",          "sensor_gps"),
+            ("📡", "LiDAR",        "sensor_lidar"),
+            ("👁", "Optical Flow", "sensor_opflow"),
+            ("🧭", "Compass",      "sensor_mag"),
+        ]
+
+        for row, (icon, name, attr_prefix) in enumerate(sensors):
+            # Icon + Tên
+            lbl_icon = QLabel(f"{icon}  {name}")
+            lbl_icon.setStyleSheet("color: #c0c0e0; font-weight: bold; font-size: 12px;")
+            grid.addWidget(lbl_icon, row, 0)
+
+            # Thanh Progress (quality indicator)
+            bar = QProgressBar()
+            bar.setMinimum(0)
+            bar.setMaximum(100)
+            bar.setValue(0)
+            bar.setTextVisible(False)
+            bar.setMaximumHeight(12)
+            bar.setStyleSheet("""
+                QProgressBar {
+                    border: 1px solid #2a2a4a;
+                    border-radius: 4px;
+                    background-color: #252540;
+                }
+                QProgressBar::chunk {
+                    border-radius: 3px;
+                    background-color: #4a4a6a;
+                }
+            """)
+            setattr(self, f"bar_{attr_prefix}", bar)
+            grid.addWidget(bar, row, 1)
+
+            # Giá trị text + trạng thái
+            val = QLabel("—")
+            val.setFont(self._bold_font)
+            val.setStyleSheet("color: #808098;")
+            val.setMinimumWidth(100)
+            setattr(self, f"val_{attr_prefix}", val)
+            grid.addWidget(val, row, 2)
 
     # ══════════════════════════════════════════════
     # BẢNG VÒNG TUA ĐỘNG CƠ (MOTORS)

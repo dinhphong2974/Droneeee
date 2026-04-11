@@ -2,7 +2,7 @@
 
 > **Mục đích**: Cung cấp toàn bộ bối cảnh dự án cho AI agent. Đọc file này TRƯỚC khi code bất kỳ thứ gì.
 >
-> **Cập nhật lần cuối**: 2026-04-05
+> **Cập nhật lần cuối**: 2026-04-10
 
 ---
 
@@ -16,11 +16,12 @@
 [PC chạy DroneGCS]  ←── TCP/Wifi ──→  [ESP32 (cầu nối)]  ←── UART ──→  [Flight Controller chạy INAV]
 ```
 
-- **ESP32** hoạt động như Access Point Wifi, tạo mạng riêng (`Drone_GCS_Wifi`), IP mặc định `192.168.4.1:8080`
+- **ESP32 hoạt động như Access Point Wifi**, tạo mạng riêng (`Drone_GCS_Wifi`), password: `DroneGCS@2026!`, IP mặc định `192.168.4.1:8080`
 - ESP32 là **cầu nối + failsafe chủ động**: nhận TCP từ PC → chuyển UART xuống FC, nhận UART từ FC → chuyển TCP lên PC
-- ESP32 có **Active Failsafe**: nếu mất tín hiệu PC > 1.5 giây → tự gửi MSP_SET_RAW_RC với AUX4=2000 (RTH) qua UART
-- ESP32 nhận cấu hình failsafe từ PC qua prefix `FS:rth` hoặc `FS:ignore`
+- **Active Failsafe**: Nếu mất tín hiệu PC > 2.0 giây → tự gửi `MSP_SET_RAW_RC` với AUX4=2000 (RTH) qua UART. Bất kể failsafe, **TCP socket luôn được giữ mở** để GCS có quyền khôi phục.
+- **Emergency Protocol**: GCS có thể gửi frame với prefix `EM:` (VD: `b"EM:$M<..."`). ESP32 sẽ lập tức xóa UART buffer cũ, chuyển tiếp ngay lập tức xuống FC và tắt failsafe, đảm bảo độ trễ thấp nhất cho lệnh Khẩn cấp.
 - **GPS + La bàn**: BZ 251 kết nối trực tiếp vào FC, cung cấp tọa độ GPS qua MSP_RAW_GPS
+- **LiDAR + Optical Flow**: Micoair MTF-02 AIO kết nối trực tiếp vào FC qua UART (MSP protocol), cung cấp rangefinder altitude (≤2.5m) và optical flow
 
 ### Tech Stack
 
@@ -165,24 +166,31 @@ QMainWindow
 
 - Class `MSPParser`
 - **Lệnh hỗ trợ**:
-  - `MSP_ANALOG (110)`: Điện áp pin (`vbat/10.0 → Volt`), dòng điện (`amp/100.0 → Ampere`)
-  - `MSP_ATTITUDE (108)`: Roll (`/10.0°`), Pitch (`/10.0°`), Yaw (`0-360°`)
+  - `MSP_WP_GETINFO (20)`: Thông tin mission (số waypoint)
+  - `MSP_SONAR_ALTITUDE (58)`: Độ cao bề mặt từ LiDAR MTF-02 (rangefinder)
+  - `MSP_STATUS (101)`: Trạng thái ARM + flight mode flags
+  - `MSP_RAW_GPS (106)`: Tọa độ GPS, số vệ tinh, tốc độ (từ GPS BZ 251)
+  - `MSP_ATTITUDE (108)`: Góc nghiêng Roll, Pitch, Yaw
+  - `MSP_ALTITUDE (109)`: Độ cao barometer + vario
+  - `MSP_ANALOG (110)`: Điện áp pin, dòng điện
 - **Đóng gói**: `pack_msg(cmd, payload) → bytes` : Frame = `$M<` + Size + Cmd + Payload + Checksum
 - **Giải mã**: `parse_buffer(data) → dict` : Gom buffer chống đứt gói, tìm `$M>`, verify checksum XOR
+- **Buffer Protection**: MAX_BUFFER_SIZE = 4096 bytes, tự cắt khi vượt quá
 - **Struct format**:
   - MSP_ANALOG: `'<B H H h'` (7 bytes: vbat, mah_drawn, rssi, amperage)
   - MSP_ATTITUDE: `'<h h h'` (6 bytes: roll, pitch, yaw)
+  - MSP_SONAR_ALTITUDE: `'<i'` (4 bytes: surface_alt_cm, âm = ngoài tầm)
 
 #### `ESP32/main.py` — Firmware MicroPython
 
-- Wifi AP: SSID `Drone_GCS_Wifi`, password `password123`
-- UART1: baudrate=115200, TX=17, RX=16
-- TCP Server: port 8080, non-blocking
-- 3 luồng xử lý trong vòng lặp chính:
-  1. **Quản lý kết nối**: Accept client mới
-  2. **PC → FC**: recv TCP → write UART
-  3. **FC → PC**: read UART → send TCP
-- **Failsafe**: Mất tín hiệu > 1000ms → ngắt socket, chờ kết nối lại
+- Wifi AP: SSID `Drone_GCS_Wifi`, password `DroneGCS@2026!`
+- UART1: baudrate=115200, TX=17, RX=16 (Buffer=512)
+- TCP Server: port 8080, non-blocking. Single client.
+- 4 luồng xử lý trong vòng lặp chính:
+  1. **Quản lý kết nối**: Accept client mới. Đóng kết nối nếu send() lỗi liên tiếp 10 lần.
+  2. **PC → FC**: Đọc TCP, xử lý prefix (`FS:`, `EM:`, `HB:`). Nếu là `EM:`, xoá UART buffer và flush lệnh khẩn cấp. Mặc định: chuyển trực tiếp rbytes.
+  3. **FC → PC**: read UART (max 256 bytes) → send TCP
+  4. **Failsafe Watchdog**: Mất tín hiệu > 2000ms → gửi RTH liên tục (10Hz). **KHÔNG đóng socket** trong vòng lặp failsafe.
 
 ---
 
@@ -243,6 +251,8 @@ QMainWindow
 | `motor2` | int | PWM μs (1000-2000) | *(chưa implement)* | — |
 | `motor3` | int | PWM μs (1000-2000) | *(chưa implement)* | — |
 | `motor4` | int | PWM μs (1000-2000) | *(chưa implement)* | — |
+| `surface_altitude` | float | Mét | MSP_SONAR_ALTITUDE | `surface_alt_cm / 100.0`, -1.0 nếu OOR |
+| `surface_quality` | int | 0-255 | MSP_SONAR_ALTITUDE | 255 nếu hợp lệ, 0 nếu OOR |
 
 ---
 
@@ -301,11 +311,11 @@ QMainWindow
 |---|---|
 | Wifi Mode | Access Point |
 | SSID | `Drone_GCS_Wifi` |
-| Password | `password123` |
+| Password | `DroneGCS@2026!` |
 | IP | `192.168.4.1` |
 | TCP Port | `8080` |
 | UART | Baudrate 115200, TX=GPIO17, RX=GPIO16 |
-| Failsafe timeout | 1000ms |
+| Failsafe timeout | 2000ms |
 
 ---
 
@@ -380,6 +390,16 @@ QMainWindow
 - [ ] **Tab Log**: Ghi log telemetry lịch sử
 - [ ] **Motor data từ FC** (hiện chỉ có trong Mock, chưa parse MSP_MOTOR)
 
+### ✅ Đã hoàn thành (Cập nhật 2026-04-09)
+
+- [x] **MTF-02 LiDAR Integration**: MSP_SONAR_ALTITUDE polling + decode
+- [x] **Sensor Fusion**: Tự động chọn LiDAR (<2.5m) hoặc Baro
+- [x] **LiDAR-Assisted Takeoff**: Hiển thị nguồn độ cao (LiDAR/Baro) khi cất cánh
+- [x] **Soft Landing**: Giảm tốc khi LiDAR < 1m, phát hiện chạm đất < 0.15m
+- [x] **Dashboard LiDAR Display**: Surface Alt + LiDAR Quality trên Telemetry
+- [x] **Mock LiDAR**: Giả lập surface_altitude khi altitude ≤ 2.5m
+- [x] **QA Fixes**: Buffer overflow protection, thread safety, ESP32 gc.collect()
+
 ---
 
 ## 10. Hướng Dẫn Thêm Tính Năng Mới
@@ -423,7 +443,7 @@ python _test_ui_refactor.py
 
 ## 12. Ánh Xạ Kênh AUX (MSP_SET_RAW_RC)
 
-Thứ tự kênh: `[Roll, Pitch, Yaw, Throttle, AUX1, AUX2, AUX3, AUX4]`
+Thứ tự kênh (Chuẩn INAV AETR): `[Roll, Pitch, Throttle, Yaw, AUX1, AUX2, AUX3, AUX4]`
 
 | Kênh | FC Channel | Chức năng | 1000 | 1500 | 2000 |
 |---|---|---|---|---|---|
@@ -441,3 +461,13 @@ Thứ tự kênh: `[Roll, Pitch, Yaw, Throttle, AUX1, AUX2, AUX3, AUX4]`
 | 2026-03-30 | **Refactoring kiến trúc lớn**: Tách monolithic code thành module riêng biệt. Tạo `MainWindow`, `DashboardTab`, `MissionTab`, `ConfigTab`. GCSApp kế thừa MainWindow. |
 | 2026-03-30 | Cập nhật AGENT.md toàn diện với đầy đủ context cho AI agent. |
 | 2026-04-05 | **Feature Update lớn**: ESP32 failsafe chủ động (RTH/SafeLand), Emergency Overlay, Takeoff Dialog (nhập độ cao + GPS), Mission Tab với OpenStreetMap (folium + QWebEngineView), MSP_RAW_GPS + MSP_SET_WP, AUX channel mapping mới (4 AUX), DroneState GPS fields, cấu hình failsafe từ PC. |
+| 2026-04-09 | **MTF-02 LiDAR Integration**: Thêm MSP_SONAR_ALTITUDE (58), sensor fusion (LiDAR ≤2.5m / Baro), LiDAR-assisted takeoff + soft landing, Dashboard hiển thị Surface Alt + Quality. QA: buffer overflow protection, thread safety fix, ESP32 gc.collect() + yield, 13 unit tests passed. |
+| 2026-04-10 | **Critical Bug Fixes & Refactor**: Audit firmware ESP32; sửa lỗi Failsafe đóng socket gây mất quyền Emergency. Sửa channel order thành chuẩn AETR. Thêm giao thức khẩn cấp prefix `EM:` cho phép ESP32 ưu tiên xử lý lệnh DISARM bỏ qua queue TCP. Cải thiện độ ổn định kết nối. Sửa Leaflet Map init race condition bằng pure HTML/JS thay vì folium. |
+
+---
+
+## 14. Đề xuất Skills (Agent Skills)
+
+Danh sách toàn diện các kỹ năng (skills) nên được AI Agent sử dụng tùy theo bài toán (VD: `@python-pro`, `@firmware-analyst`, `@systematic-debugging`...) đã được liệt kê và giải thích chi tiết trong file riêng biệt.
+
+👉 **Vui lòng đọc file:** [`RECOMMENDED_SKILLS.md`](file:///c:/DroneGCS/RECOMMENDED_SKILLS.md) để biết khi nào nên gọi skill nào trong quá trình phát triển hệ thống DroneGCS.

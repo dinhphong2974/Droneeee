@@ -228,8 +228,8 @@ class GCSApp(MainWindow):
 
         # ── Emergency Overlay (cảnh báo khẩn cấp) ──
         self.emergency_overlay = EmergencyOverlay(self)
-        self.emergency_overlay.btn_emergency_disarm.clicked.connect(self._emergency_disarm)
-        self.emergency_overlay.btn_emergency_safe_land.clicked.connect(self._emergency_safe_land)
+        self.emergency_overlay.btn_emergency_disarm.clicked.connect(self._emergency_force_disarm)
+        self.emergency_overlay.btn_emergency_safe_land.clicked.connect(self._emergency_force_safe_land)
 
         # ── Kết nối nút điều khiển bay (từ ManualControlTab) ──
         mc = self.manual_control_tab
@@ -452,12 +452,109 @@ class GCSApp(MainWindow):
         if "latitude" in data and "longitude" in data:
             lat = data["latitude"]
             lon = data["longitude"]
+            self.drone_state.record_gps_history()
             heading = self.drone_state.yaw  # Heading từ MSP_ATTITUDE
             if lat != 0.0 or lon != 0.0:
                 self.mission_tab.update_drone_position(lat, lon, heading)
 
                 # Kiểm tra cảnh báo khoảng cách
                 self._check_distance_safety()
+
+        # ══════════════════════════════════════════════
+        # CẬP NHẬT LiDAR DATA (từ MTF-02 qua MSP_SONAR_ALTITUDE)
+        # ══════════════════════════════════════════════
+
+        if "surface_altitude" in data:
+            s_alt = data["surface_altitude"]
+            self.drone_state.surface_altitude = s_alt
+            self.drone_state.has_valid_surface = s_alt >= 0
+
+            if s_alt >= 0:
+                dash.val_surface_alt.setText(f"{s_alt:.2f} m")
+                dash.val_surface_alt.setStyleSheet("color: #00E676; font-weight: bold;")
+            else:
+                dash.val_surface_alt.setText("Out of Range")
+                dash.val_surface_alt.setStyleSheet("color: #808098; font-weight: bold;")
+
+        if "surface_quality" in data:
+            s_qual = data["surface_quality"]
+            self.drone_state.surface_quality = s_qual
+            qual_color = "#00E676" if s_qual > 100 else ("#FFC107" if s_qual > 0 else "#F44336")
+            dash.val_lidar_qual.setText(str(s_qual))
+            dash.val_lidar_qual.setStyleSheet(f"color: {qual_color}; font-weight: bold;")
+
+        # ══════════════════════════════════════════════
+        # CẬP NHẬT SENSOR HEALTH CARD (từ MSP_STATUS_EX)
+        # ══════════════════════════════════════════════
+
+        if "sensor_opflow" in data:
+            self.drone_state.sensor_opflow = data["sensor_opflow"]
+            if data["sensor_opflow"]:
+                dash.val_opflow.setText("✅ Active")
+                dash.val_opflow.setStyleSheet("color: #00E676; font-weight: bold;")
+                dash.bar_sensor_opflow.setValue(100)
+                dash.bar_sensor_opflow.setStyleSheet(
+                    "QProgressBar { border: 1px solid #2a2a4a; border-radius: 4px; background-color: #252540; }"
+                    "QProgressBar::chunk { border-radius: 3px; background-color: #00E676; }"
+                )
+                dash.val_sensor_opflow.setText("Active")
+                dash.val_sensor_opflow.setStyleSheet("color: #00E676; font-weight: bold;")
+            else:
+                dash.val_opflow.setText("⚠️ Inactive")
+                dash.val_opflow.setStyleSheet("color: #FFC107; font-weight: bold;")
+                dash.bar_sensor_opflow.setValue(0)
+                dash.val_sensor_opflow.setText("Inactive")
+                dash.val_sensor_opflow.setStyleSheet("color: #FFC107; font-weight: bold;")
+
+        if "sensor_rangefinder" in data:
+            self.drone_state.sensor_rangefinder = data["sensor_rangefinder"]
+            if data["sensor_rangefinder"]:
+                dash.bar_sensor_lidar.setValue(100)
+                dash.bar_sensor_lidar.setStyleSheet(
+                    "QProgressBar { border: 1px solid #2a2a4a; border-radius: 4px; background-color: #252540; }"
+                    "QProgressBar::chunk { border-radius: 3px; background-color: #00E676; }"
+                )
+                dash.val_sensor_lidar.setText("Active")
+                dash.val_sensor_lidar.setStyleSheet("color: #00E676; font-weight: bold;")
+            else:
+                dash.bar_sensor_lidar.setValue(0)
+                dash.val_sensor_lidar.setText("Off")
+                dash.val_sensor_lidar.setStyleSheet("color: #808098; font-weight: bold;")
+
+        if "sensor_mag" in data:
+            self.drone_state.sensor_mag = data["sensor_mag"]
+            if data["sensor_mag"]:
+                dash.bar_sensor_mag.setValue(100)
+                dash.bar_sensor_mag.setStyleSheet(
+                    "QProgressBar { border: 1px solid #2a2a4a; border-radius: 4px; background-color: #252540; }"
+                    "QProgressBar::chunk { border-radius: 3px; background-color: #00E676; }"
+                )
+                dash.val_sensor_mag.setText("OK")
+                dash.val_sensor_mag.setStyleSheet("color: #00E676; font-weight: bold;")
+            else:
+                dash.bar_sensor_mag.setValue(0)
+                dash.val_sensor_mag.setText("Off")
+                dash.val_sensor_mag.setStyleSheet("color: #808098; font-weight: bold;")
+
+        if "sensor_gps" in data:
+            self.drone_state.sensor_gps = data["sensor_gps"]
+
+        if "sensor_baro" in data:
+            self.drone_state.sensor_baro = data["sensor_baro"]
+
+        # Cập nhật GPS sensor health bar dựa trên số vệ tinh
+        if "gps_num_sat" in data:
+            num_sat = data["gps_num_sat"]
+            gps_quality = min(100, int(num_sat / 12 * 100))
+            dash.bar_sensor_gps.setValue(gps_quality)
+            gps_color = "#00E676" if num_sat >= 8 else ("#FFC107" if num_sat >= 4 else "#F44336")
+            dash.bar_sensor_gps.setStyleSheet(
+                f"QProgressBar {{ border: 1px solid #2a2a4a; border-radius: 4px; background-color: #252540; }}"
+                f"QProgressBar::chunk {{ border-radius: 3px; background-color: {gps_color}; }}"
+            )
+            fix_text = "3D" if self.drone_state.gps_fix_type >= 2 else ("2D" if self.drone_state.gps_fix_type == 1 else "No")
+            dash.val_sensor_gps.setText(f"{num_sat} sats ({fix_text})")
+            dash.val_sensor_gps.setStyleSheet(f"color: {gps_color}; font-weight: bold;")
 
     # ══════════════════════════════════════════════
     # QUẢN LÝ TRẠNG THÁI UI
@@ -471,7 +568,8 @@ class GCSApp(MainWindow):
             dash.val_batt_curr, dash.val_mode, dash.val_armed, dash.val_alt,
             dash.val_lat, dash.val_lon, dash.val_roll, dash.val_pitch,
             dash.val_yaw, dash.val_gps_fix, dash.val_sats, dash.val_spd,
-            dash.val_motor1, dash.val_motor2, dash.val_motor3, dash.val_motor4
+            dash.val_motor1, dash.val_motor2, dash.val_motor3, dash.val_motor4,
+            dash.val_surface_alt, dash.val_lidar_qual, dash.val_opflow
         ]
         for lbl in labels_to_na:
             lbl.setText("N/A")
@@ -583,7 +681,10 @@ class GCSApp(MainWindow):
                 "QPushButton:hover { background-color: #F57C00; } "
                 "QPushButton:disabled { background-color: #555; color: #888; }"
             )
-            mc.btn_takeoff_hold.clicked.disconnect()
+            try:
+                mc.btn_takeoff_hold.clicked.disconnect()
+            except RuntimeError:
+                pass
             mc.btn_takeoff_hold.clicked.connect(self._confirm_takeoff)
         else:
             mc.btn_takeoff_hold.setText("⛔ ABORT")
@@ -592,7 +693,10 @@ class GCSApp(MainWindow):
                 "font-size: 14px; border-radius: 6px; } "
                 "QPushButton:hover { background-color: #D32F2F; }"
             )
-            mc.btn_takeoff_hold.clicked.disconnect()
+            try:
+                mc.btn_takeoff_hold.clicked.disconnect()
+            except RuntimeError:
+                pass
             mc.btn_takeoff_hold.clicked.connect(self.flight_controller.abort)
 
     def _on_mode_activated(self, mode_name: str):
@@ -613,14 +717,14 @@ class GCSApp(MainWindow):
     # EMERGENCY OVERLAY — NÚT KHẨN CẤP
     # ══════════════════════════════════════════════
 
-    def _emergency_disarm(self):
-        """Nút DISARM khẩn cấp từ overlay — tắt motor lập tức."""
-        self.flight_controller.disarm()
+    def _emergency_force_disarm(self):
+        """Nút DISARM khẩn cấp từ overlay — FORCE tắt motor, bypass state machine."""
+        self.flight_controller.force_disarm()
         self.emergency_overlay.hide_overlay()
 
-    def _emergency_safe_land(self):
-        """Nút Safe Land khẩn cấp từ overlay — hạ cánh tại chỗ."""
-        self.flight_controller.safe_land()
+    def _emergency_force_safe_land(self):
+        """Nút Safe Land khẩn cấp từ overlay — FORCE hạ cánh, bypass state machine."""
+        self.flight_controller.force_safe_land()
 
     # ══════════════════════════════════════════════
     # MISSION LOGIC

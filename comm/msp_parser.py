@@ -8,12 +8,13 @@ Module này xử lý toàn bộ logic bóc tách gói tin MSP:
 - Tính và xác thực checksum chống nhiễu
 
 Lệnh MSP hỗ trợ:
+- MSP_WP_GETINFO (20): Thông tin mission (số waypoint)
+- MSP_SONAR_ALTITUDE (58): Độ cao bề mặt từ LiDAR/Sonar (MTF-02)
 - MSP_STATUS (101): Trạng thái ARM + flight mode flags
 - MSP_RAW_GPS (106): Tọa độ GPS, số vệ tinh, tốc độ (từ GPS BZ 251)
 - MSP_ATTITUDE (108): Góc nghiêng Roll, Pitch, Yaw
 - MSP_ALTITUDE (109): Độ cao barometer + vario
 - MSP_ANALOG (110): Điện áp pin, dòng điện
-- MSP_WP_GETINFO (20): Thông tin mission (số waypoint)
 - MSP_SET_RAW_RC (200): Gửi 8 kênh RC (ARM, throttle, AUX1-4)
 - MSP_SET_WP (209): Gửi waypoint xuống FC cho NAV WP mission
 
@@ -21,6 +22,7 @@ Thông số phần cứng liên quan:
 - Pin: Lipo 6S (19.8V rỗng → 25.2V đầy)
 - Động cơ: 1960kv (PWM range: 1000-2000μs)
 - GPS: BZ 251 (GPS + La bàn)
+- LiDAR: Micoair MTF-02 AIO (Optical Flow + Rangefinder, range ≤2.5m)
 """
 
 import struct
@@ -30,12 +32,14 @@ import struct
 # ══════════════════════════════════════════════
 
 # ── Lệnh đọc dữ liệu (FC → PC) ──
-MSP_WP_GETINFO = 20    # Lấy thông tin mission (tổng số waypoint, max WP)
-MSP_STATUS     = 101   # Lấy trạng thái ARM + flight mode flags
-MSP_RAW_GPS    = 106   # Lấy tọa độ GPS, vệ tinh, tốc độ (từ GPS BZ 251)
-MSP_ATTITUDE   = 108   # Lấy góc nghiêng (Roll, Pitch, Yaw)
-MSP_ALTITUDE   = 109   # Lấy độ cao ước lượng (barometer)
-MSP_ANALOG     = 110   # Lấy thông số pin (Voltage, Current)
+MSP_WP_GETINFO      = 20    # Lấy thông tin mission (tổng số waypoint, max WP)
+MSP_SONAR_ALTITUDE  = 58    # Lấy độ cao bề mặt từ rangefinder/LiDAR (MTF-02)
+MSP_STATUS          = 101   # Lấy trạng thái ARM + flight mode flags
+MSP_RAW_GPS         = 106   # Lấy tọa độ GPS, vệ tinh, tốc độ (từ GPS BZ 251)
+MSP_ATTITUDE        = 108   # Lấy góc nghiêng (Roll, Pitch, Yaw)
+MSP_ALTITUDE        = 109   # Lấy độ cao ước lượng (barometer)
+MSP_ANALOG          = 110   # Lấy thông số pin (Voltage, Current)
+MSP_STATUS_EX       = 150   # Trạng thái mở rộng: sensor health + arming disable flags
 
 # ── Lệnh ghi dữ liệu (PC → FC) ──
 MSP_SET_RAW_RC = 200   # Gửi 8 kênh RC xuống FC (ARM, throttle, AUX...)
@@ -54,6 +58,10 @@ GPS_COORD_SCALE = 10_000_000.0  # Hệ số chia tọa độ GPS (lat/lon x 10^7
 
 # ── Kích thước frame tối thiểu ──
 MIN_FRAME_SIZE = 6  # Header(3) + Size(1) + Cmd(1) + Checksum(1)
+
+# ── Giới hạn buffer chống tràn bộ nhớ ──
+MAX_BUFFER_SIZE = 4096  # Cắt buffer nếu vượt quá (byte rác liên tục)
+MAX_PAYLOAD_SIZE = 255  # Giới hạn cứng MSP v1: size field là 1 byte (0–255)
 
 
 class MSPParser:
@@ -184,6 +192,10 @@ class MSPParser:
         self.buffer.extend(data)
         parsed_data = {}
 
+        # Chống tràn bộ nhớ: cắt buffer nếu nhận quá nhiều byte rác
+        if len(self.buffer) > MAX_BUFFER_SIZE:
+            self.buffer = self.buffer[-MAX_BUFFER_SIZE:]
+
         # Quét buffer tìm tất cả frame MSP response
         while MSP_HEADER_RESPONSE in self.buffer:
             start_idx = self.buffer.find(MSP_HEADER_RESPONSE)
@@ -198,6 +210,15 @@ class MSPParser:
 
             size = self.buffer[3]
             cmd = self.buffer[4]
+
+            # BUG GUARD: Reject frame nếu size > MAX_PAYLOAD_SIZE (255)
+            # MSP v1 dùng 1 byte cho size field → max 255 bytes payload.
+            # Rogue frame / byte rác có thể giả làm header khiến parser chờ mãi.
+            # Xử lý: bỏ qua byte header này và tiếp tục tìm kiếm header mới.
+            if size > MAX_PAYLOAD_SIZE:
+                self.buffer = self.buffer[1:]  # Skip byte '$', tìm header tiếp theo
+                continue
+
             frame_length = MIN_FRAME_SIZE + size
 
             # Kiểm tra đã nhận đủ toàn bộ Payload + Checksum chưa
@@ -260,12 +281,13 @@ class MSPParser:
             dict: Dữ liệu đã giải mã theo key-value
 
         Lệnh hỗ trợ:
-        - MSP_ANALOG (110): Điện áp pin 6S, dòng điện
+        - MSP_WP_GETINFO (20): Thông tin mission
+        - MSP_SONAR_ALTITUDE (58): Độ cao bề mặt LiDAR (MTF-02)
+        - MSP_STATUS (101): Trạng thái ARM + flight mode flags
         - MSP_RAW_GPS (106): Tọa độ GPS, số vệ tinh, tốc độ
         - MSP_ATTITUDE (108): Góc Roll, Pitch, Yaw
         - MSP_ALTITUDE (109): Độ cao barometer + vario
-        - MSP_STATUS (101): Trạng thái ARM + flight mode flags
-        - MSP_WP_GETINFO (20): Thông tin mission
+        - MSP_ANALOG (110): Điện áp pin 6S, dòng điện
         """
         result = {}
 
@@ -333,6 +355,52 @@ class MSPParser:
                 reserved, max_wp, is_valid = struct.unpack('<B B B', payload[:3])
                 result['wp_max'] = max_wp
                 result['wp_is_valid'] = bool(is_valid)
+
+            elif cmd == MSP_STATUS_EX and size >= 15:
+                # ═══════════════════════════════════════
+                # MSP_STATUS_EX (150) — Trạng thái mở rộng INAV
+                # ═══════════════════════════════════════
+                # Cấu trúc (phần quan trọng):
+                #   cycle_time(2B) + i2c_errors(2B) + sensors_present(2B)
+                #   + flight_mode_flags(4B) + config_profile(1B)
+                #   + system_load(2B)
+                # → sensors_present (offset 4-5) là bitfield sensor:
+                #   Bit 0 = ACC, Bit 1 = BARO, Bit 2 = MAG (compass)
+                #   Bit 3 = GPS, Bit 4 = RANGEFINDER, Bit 5 = OPFLOW
+                #   Bit 6 = PITOT
+                sensors_present = struct.unpack('<H', payload[4:6])[0]
+                result['sensor_acc']         = bool(sensors_present & (1 << 0))
+                result['sensor_baro']        = bool(sensors_present & (1 << 1))
+                result['sensor_mag']         = bool(sensors_present & (1 << 2))
+                result['sensor_gps']         = bool(sensors_present & (1 << 3))
+                result['sensor_rangefinder'] = bool(sensors_present & (1 << 4))
+                result['sensor_opflow']      = bool(sensors_present & (1 << 5))
+                result['sensor_pitot']       = bool(sensors_present & (1 << 6))
+
+                # flight_mode_flags tại offset 6-9
+                flags = struct.unpack('<I', payload[6:10])[0]
+                result['is_armed'] = bool(flags & (1 << 0))
+                result['flight_mode_flags'] = flags
+
+                # system_load tại offset 11-12
+                if size >= 13:
+                    sys_load = struct.unpack('<H', payload[11:13])[0]
+                    result['system_load'] = sys_load  # % CPU load
+
+            elif cmd == MSP_SONAR_ALTITUDE and size >= 4:
+                # ═══════════════════════════════════════
+                # MSP_SONAR_ALTITUDE (58) — Độ cao bề mặt từ LiDAR MTF-02
+                # ═══════════════════════════════════════
+                # Cấu trúc: surface_altitude(4B int32, cm)
+                # Giá trị âm = ngoài tầm đo (out of range)
+                # MTF-02 AIO: rangefinder range ≤ 2.5m (250cm)
+                surface_alt_cm = struct.unpack('<i', payload[:4])[0]
+                if surface_alt_cm >= 0:
+                    result['surface_altitude'] = surface_alt_cm / 100.0  # cm → mét
+                    result['surface_quality'] = 255  # MSP_SONAR không gửi quality riêng
+                else:
+                    result['surface_altitude'] = -1.0  # Đánh dấu ngoài tầm
+                    result['surface_quality'] = 0
 
         except struct.error:
             # Firmware FC phiên bản khác có thể có cấu trúc byte khác

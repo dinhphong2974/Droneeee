@@ -76,3 +76,25 @@ nhưng **KHÔNG ghi** `roll/pitch/yaw` vào `drone_state`. Khi chỉ có 1 trong
 | `main.py` | `drone_state.voltage/current` không bao giờ được ghi | Thêm `self.drone_state.voltage = v` và `self.drone_state.current` |
 | `main.py` | Widget 3D dùng `data.get()` với fallback cũ thay vì `drone_state` | Đổi thành `self.drone_state.roll/pitch/yaw` — single source of truth |
 | `attitude_3d_widget.py` | Panda3D init có thể fail silent (không try/except) | Bọc `showEvent` trong `try/except`, in lỗi ra console nếu fail |
+
+---
+
+## 2026-04-10 — Firmware Audit & Critical Emergency Bug Fix
+
+### Tổng quan
+Sau một cuộc kiểm tra sâu (audit) bằng các phương pháp `@firmware-analyst` và `@systematic-debugging`, đã phát hiện 7 lỗi (bao gồm 2 lỗi Critical) trong firmware ESP32 cũ khiến cho lệnh khẩn cấp (DISARM/Safe Land) bị kẹt hoặc bỏ qua khi drone đang cất cánh.
+
+### Lỗi đã sửa & Thay đổi cấu trúc
+
+| Bug / Issue | Nguyên nhân gốc | Cách sửa |
+|---|---|---|
+| Failsafe chặn lệnh Emergency (CRITICAL) | `conn.close()` bị gọi ngay khi mất tín hiệu WiFi 1.5s, làm đứt TCP dẫn đến GCS mất quyền gửi lệnh khẩn cấp khi WiFi chập chờn. | Viết lại vòng lặp ESP32: **KHÔNG đóng socket** trong trạng thái failsafe. Socket chỉ đóng khi GCS `send()` bị lỗi thực sự ≥10 lần liên tiếp. |
+| Race condition khi nhận Emergency (CRITICAL) | Nếu lệnh khẩn cấp rơi vào lúc `recv()` timeout/chờ, socket bị đóng ở đoạn failsafe. | Tách đôi logic đọc TCP và kiểm tra timeout; đảm bảo `recv()` chỉ bắt `OSError` do non-blocking socket mà không ngắt quyền tiếp nhận. |
+| Không đồng nhất Channel Order (HIGH) | ESP32 dùng RPYT, trong khi GCS dùng AETR. Điều này có thể khiến lệnh Throttle/Yaw bị lộn vị trí khi RTH. | Sửa ESP32 constants thành chuẩn **AETR** (`[Roll, Pitch, Throttle, Yaw, AUX1-4]`) để khớp đồng nhất 100% với GCS và INAV. |
+| Thiếu cơ chế ưu tiên lệnh (HIGH) | GCS gửi `force_disarm()` bị chặn sau queue TCP. | Thêm prefix giao thức `"EM:"`. ESP32 khi nhận `"EM:"` sẽ xóa rác trong UART buffer UART, gửi frame khẩn cấp ngay lập tức và cưỡng chế tắt failsafe state. |
+
+### Cập nhật Documentation
+- `AGENT.md` đã được update toàn diện cho ngày `2026-04-10`.
+- Bổ sung cấu trúc luồng Emergency Protocol.
+- Thêm section **Đề xuất Skills** để các AI Agents tương lai biết gọi đúng công cụ (e.g. `@firmware-analyst`, `@systematic-debugging`, v.v.).
+- Mật khẩu WiFi Access Point đổi từ `password123` sang an toàn hơn: `DroneGCS@2026!`.

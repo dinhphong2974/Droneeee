@@ -55,6 +55,7 @@ class EmergencyOverlay(QWidget):
         self._fade_anim = QPropertyAnimation(self._opacity_effect, b"opacity")
         self._fade_anim.setDuration(300)  # 300ms
         self._fade_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        self._fade_out_connected = False  # Theo dõi trạng thái connect signal
 
         # ── Xây dựng UI ──
         self._setup_ui()
@@ -174,12 +175,17 @@ class EmergencyOverlay(QWidget):
         self._fade_anim.stop()
         self._fade_anim.setStartValue(self._opacity_effect.opacity())
         self._fade_anim.setEndValue(0.0)
-        self._fade_anim.finished.connect(self._on_fade_out_done)
+        # Chỉ connect nếu chưa connect — tránh signal leak + RuntimeWarning
+        if not self._fade_out_connected:
+            self._fade_anim.finished.connect(self._on_fade_out_done)
+            self._fade_out_connected = True
         self._fade_anim.start()
 
     def _on_fade_out_done(self):
         """Callback khi animation fade-out kết thúc — ẩn widget."""
-        self._fade_anim.finished.disconnect(self._on_fade_out_done)
+        if self._fade_out_connected:
+            self._fade_anim.finished.disconnect(self._on_fade_out_done)
+            self._fade_out_connected = False
         if self._opacity_effect.opacity() < 0.05:
             self.hide()
 

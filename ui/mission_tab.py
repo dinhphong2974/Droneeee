@@ -166,7 +166,7 @@ class MissionTab(QWidget):
 
         # ── BÊN TRÁI: Bản đồ OpenStreetMap (70%) ──
         self._create_map_view()
-        splitter.addWidget(self.map_view)
+        splitter.addWidget(self.map_container)
 
         # ── BÊN PHẢI: Panel điều khiển (30%) ──
         right_panel = QWidget()
@@ -202,7 +202,12 @@ class MissionTab(QWidget):
     # ══════════════════════════════════════════════
 
     def _create_map_view(self):
-        """Tạo QWebEngineView để nhúng bản đồ OpenStreetMap."""
+        """Tạo QWebEngineView để nhúng bản đồ OpenStreetMap, với nút định vị drone."""
+        # ── Container widget giữ map + nút overlay ──
+        self.map_container = QWidget()
+        map_container_layout = QVBoxLayout(self.map_container)
+        map_container_layout.setContentsMargins(0, 0, 0, 0)
+
         self.map_view = QWebEngineView()
         self.map_view.setMinimumSize(500, 400)
 
@@ -231,6 +236,34 @@ class MissionTab(QWidget):
         # ── Kết nối loadFinished để biết khi nào map sẵn sàng ──
         # JavaScript chỉ chạy SAFE sau khi signal này fire với ok=True
         self.map_view.loadFinished.connect(self._on_map_loaded)
+
+        map_container_layout.addWidget(self.map_view)
+
+        # ── Nút định vị drone — nằm đè lên bản đồ (bottom-left) ──
+        # Parent = map_container (KHÔNG phải map_view) vì QWebEngineView
+        # render nội dung web trong process riêng, che mất child widget.
+        self.btn_locate_drone = QPushButton("📍", self.map_container)
+        self.btn_locate_drone.setFixedSize(42, 42)
+        self.btn_locate_drone.setToolTip("Định vị drone — Chuyển về vị trí drone hiện tại")
+        self.btn_locate_drone.setCursor(Qt.PointingHandCursor)
+        self.btn_locate_drone.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(37, 37, 64, 0.92);
+                color: #4FC3F7;
+                font-size: 20px;
+                border: 2px solid #3a3a60;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background-color: rgba(58, 58, 106, 0.95);
+                border-color: #4FC3F7;
+            }
+            QPushButton:pressed {
+                background-color: rgba(79, 195, 247, 0.3);
+            }
+        """)
+        self.btn_locate_drone.clicked.connect(self._locate_drone)
+        self.btn_locate_drone.raise_()  # Đảm bảo nút nổi lên trên map
 
     def _load_map(self):
         """
@@ -280,6 +313,9 @@ class MissionTab(QWidget):
         self.map_is_ready = True
         print("[MissionTab] OK - map.html loaded successfully")
 
+        # ── Đặt vị trí nút định vị (lần đầu) ──
+        self._reposition_locate_button()
+
         # ── Sync lại dữ liệu hiện có lên map (nếu có) ──
         # Trường hợp: GPS data đã nhận trước khi map load xong
         if self._has_home:
@@ -323,8 +359,12 @@ class MissionTab(QWidget):
 
     def _js_update_waypoints(self):
         """Gọi JS updateWaypoints() — vẽ lại tất cả waypoint markers + route."""
+        # BUG-05 FIX: Dùng json.dumps() hai lần để tạo JS string literal an toàn.
+        # json.dumps(self._waypoints) → chuỗi JSON (có thể chứa dấu ' nếu có comment)
+        # json.dumps(wp_json)         → escape thành JS string literal hợp lệ: "..."
+        # Trước đây: f"updateWaypoints('{wp_json}');" bị syntax error nếu wp_json có dấu '
         wp_json = json.dumps(self._waypoints)
-        self._run_js(f"updateWaypoints('{wp_json}');")
+        self._run_js(f"updateWaypoints({json.dumps(wp_json)});")
 
     def _js_set_view(self, lat: float, lon: float, zoom: int = 0):
         """Gọi JS setMapView() — di chuyển bản đồ tới vị trí."""
@@ -333,6 +373,44 @@ class MissionTab(QWidget):
     def _js_clear_all(self):
         """Gọi JS clearAll() — xóa toàn bộ markers và polylines."""
         self._run_js("clearAll();")
+
+    # ══════════════════════════════════════════════
+    # NÚT ĐỊNH VỊ DRONE
+    # ══════════════════════════════════════════════
+
+    def _locate_drone(self):
+        """
+        Chuyển bản đồ ngay lập tức về vị trí GPS hiện tại của drone.
+
+        Nếu chưa có GPS fix (lat=0, lon=0), hiển thị cảnh báo.
+        """
+        if self._drone_lat == 0.0 and self._drone_lon == 0.0:
+            QMessageBox.warning(
+                self,
+                "Không có vị trí",
+                "Chưa nhận được tọa độ GPS từ drone.\n"
+                "Hãy đảm bảo drone đã kết nối và có GPS fix."
+            )
+            return
+
+        self._js_set_view(self._drone_lat, self._drone_lon, 17)
+        print(f"[MissionTab] Locate drone: ({self._drone_lat:.6f}, {self._drone_lon:.6f})")
+
+    def resizeEvent(self, event):
+        """
+        Giữ nút định vị ở góc dưới-trái bản đồ khi resize.
+        """
+        super().resizeEvent(event)
+        self._reposition_locate_button()
+
+    def _reposition_locate_button(self):
+        """Đặt nút 📍 ở góc dưới-trái map_container, phía trên attribution."""
+        if hasattr(self, 'btn_locate_drone') and hasattr(self, 'map_container'):
+            margin = 12
+            x = margin
+            y = self.map_container.height() - self.btn_locate_drone.height() - margin - 20
+            self.btn_locate_drone.move(x, max(y, margin))
+            self.btn_locate_drone.raise_()  # Luôn giữ trên cùng
 
     # ══════════════════════════════════════════════
     # REFRESH MAP (legacy compatibility)

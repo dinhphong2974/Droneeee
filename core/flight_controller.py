@@ -3,10 +3,21 @@ flight_controller.py - Điều phối lệnh bay tự động.
 
 Module này quản lý các chuỗi lệnh bay phức tạp:
 - ARM / DISARM (với cơ chế chờ RC link ổn định — INAV safety)
-- Takeoff & Hold (cất cánh và giữ độ cao + vị trí bằng GPS)
+- Takeoff & Hold (cất cánh bằng NAV ALTHOLD + POSHOLD của INAV firmware)
 - Safe Land (hạ cánh khẩn cấp tại chỗ qua AUX3)
 - RTH (Return To Home qua AUX4)
 - Mission waypoint upload (MSP_SET_WP)
+
+Cơ chế cất cánh (INAV ALTHOLD):
+- Bật NAV ALTHOLD + NAV POSHOLD (AUX2=2000) ngay sau khi ARM
+- Throttle > 1500 = lệnh leo (climb rate), INAV PID tự điều khiển motor
+- Throttle = 1500 = giữ độ cao (hover), INAV tự lock
+- GCS chỉ giám sát độ cao từ telemetry, KHÔNG điều khiển motor trực tiếp
+
+Sensor Fusion (do INAV firmware xử lý):
+- LiDAR MTF-02: INAV tự sử dụng qua nav_surface_control = AUTO
+- Barometer: INAV tự kết hợp với LiDAR cho sensor fusion
+- GCS không cần code sensor fusion thủ công
 
 Sử dụng QTimer để chạy state machine không chặn UI.
 Gửi lệnh MSP qua WifiWorker.send_command().
@@ -17,6 +28,12 @@ Gửi lệnh MSP qua WifiWorker.send_command().
 - AUX2 (CH6): Flight Mode → 1000=Acro, 1500=ANGLE, 2000=ALTHOLD+POSHOLD
 - AUX3 (CH7): Safe Land → 2000=Kích hoạt, 1000=Bình thường
 - AUX4 (CH8): RTH → 2000=Kích hoạt, 1000=Bình thường
+
+Cấu hình INAV CLI cần thiết:
+- nav_use_midthr_for_althold = 1  (50% throttle = hover)
+- nav_mc_hover_thr = 1500          (hint hover throttle)
+- nav_mc_auto_climb_rate = 300     (climb rate tối đa 3m/s)
+- nav_surface_control = AUTO       (INAV tự dùng LiDAR MTF-02)
 
 KHÔNG truy cập trực tiếp socket hay widget UI.
 """
@@ -53,10 +70,10 @@ class FlightController(QObject):
     # ── Hằng số bay ──
     ALTITUDE_TOLERANCE = 0.3        # ±0.3m (chấp nhận được với barometer + GPS)
     THROTTLE_MIN = 1000             # Ga tối thiểu (μs)
-    THROTTLE_HOVER = 1500           # Ga hover ước lượng (μs)
-    THROTTLE_MAX_CLIMB = 1600       # Ga tối đa khi leo (μs) — giới hạn an toàn
-    THROTTLE_RAMP_STEP = 10         # Tăng ga mỗi tick nhanh (μs)
-    THROTTLE_FINE_STEP = 5          # Tăng ga mỗi tick chậm (μs)
+    THROTTLE_CLIMB_CMD = 1700       # Tín hiệu "leo" cho INAV ALTHOLD (μs)
+                                    # Trong ALTHOLD: >1500 = climb, 1500 = hover, <1500 = descend
+                                    # 1700 ≈ climb rate 2-3m/s (tuỳ nav_mc_auto_climb_rate)
+    THROTTLE_DESCEND_CMD = 1350     # Tín hiệu "hạ" nhẹ cho INAV ALTHOLD (μs)
     RC_CENTER = 1500                # Giá trị trung tâm kênh RC
 
     # ══════════════════════════════════════════════
@@ -88,6 +105,17 @@ class FlightController(QObject):
     ARM_TIMEOUT_S = 5.0             # Timeout chờ ARM (giây) — tăng lên để chắc chắn
     CLIMB_TIMEOUT_S = 15.0          # Timeout đạt độ cao (giây)
     ARMED_WAIT_S = 0.5              # Chờ ổn định sau ARM (giây)
+
+    # ── LiDAR MTF-02 — Sensor Fusion ──
+    LIDAR_MAX_RANGE_M = 2.5         # Tầm đo tối đa MTF-02 AIO (2.5m)
+    LIDAR_SOFT_LAND_THRESHOLD = 1.0 # Dưới 1m → dùng LiDAR để hạ cánh mềm
+    LIDAR_GROUND_PROXIMITY = 0.15   # Nhỏ hơn 15cm → coi là đã chạm đất
+
+    # ── Mission Upload ──
+    WP_UPLOAD_DELAY_S = 0.005       # Delay 5ms giữa các WP frames (tránh TCP queue flood)
+    WP_UPLOAD_TIMEOUT_S = 3.0       # Timeout chờ upload WP xong
+    NAV_WP_ACTIVATE_WAIT_S = 1.0    # Chờ 1s sau upload trước khi bật NAV WP
+
 
     # ── Chỉ số kênh RC (thứ tự gửi trong MSP_SET_RAW_RC) ──
     # Thứ tự: [Roll, Pitch, Yaw, Throttle, AUX1, AUX2, AUX3, AUX4]
@@ -123,6 +151,10 @@ class FlightController(QObject):
         self._arm_start_time = 0.0
         self._armed_wait_start = 0.0
         self._climb_start_time = 0.0
+        self._wp_upload_time = 0.0
+
+        # ── Takeoff mode ──
+        self._use_nav_wp_takeoff = True  # Mặc định dùng NAV WP; chuyển False nếu GPS yếu
 
         # ── QTimer chạy state machine (10Hz) ──
         self._timer = QTimer(self)
@@ -164,6 +196,7 @@ class FlightController(QObject):
 
     def disarm(self):
         """DISARM drone — tắt AUX, hạ ga, dừng state machine."""
+        self._state = "IDLE"  # Set state TRƯỚC để tick cuối (nếu có) sẽ tự dừng
         self._timer.stop()
         self._channels = self._safe_channels()
         self._send_rc()
@@ -173,10 +206,12 @@ class FlightController(QObject):
 
     def takeoff_and_hold(self, target_alt: float = 3.0):
         """
-        Chuỗi tự động: ARM → Tăng ga từ từ → Giữ độ cao + vị trí (GPS Position Hold).
+        Chuỗi tự động: ARM → Bật NAV ALTHOLD → Ra lệnh leo → Giữ độ cao.
 
-        Sử dụng AUX2=2000 (NAV ALTHOLD + NAV POSHOLD) khi đạt độ cao mục tiêu.
-        GPS BZ 251 cung cấp tọa độ giúp FC giữ vị trí chính xác.
+        Sử dụng INAV ALTHOLD (AUX2=2000) ngay sau khi ARM.
+        Throttle > 1500 = lệnh leo (climb rate), INAV PID tự điều khiển motor.
+        Khi đạt độ cao → đưa throttle về 1500 = INAV tự giữ.
+        GPS BZ 251 cung cấp tọa độ giúp FC giữ vị trí chính xác (POSHOLD).
 
         Args:
             target_alt: Độ cao mục tiêu (mét). Người dùng nhập từ dialog.
@@ -200,9 +235,12 @@ class FlightController(QObject):
         Sau khi chạm đất, FC tự DISARM.
 
         Dùng cho:
-        - Nút "Safe Land" khẩn cấp trên UI
+        - Nút "Safe Land" trên Manual Control tab
         - Failsafe khi mất kết nối WiFi
         """
+        # STOP bất kỳ state machine nào đang chạy (takeoff, climb...)
+        self._timer.stop()
+
         if not self._worker:
             self.error_occurred.emit("Chưa kết nối — không thể Safe Land")
             return
@@ -210,13 +248,102 @@ class FlightController(QObject):
         self.status_update.emit("Đang kích hoạt Safe Land...")
         self._channels[self.CH_AUX3] = self.AUX_SAFE_LAND_ON
         self._channels[self.CH_AUX4] = self.AUX_RTH_OFF  # Đảm bảo RTH tắt
+        self._channels[self.CH_AUX2] = self.AUX_ANGLE     # Về ANGLE, tránh xung đột POSHOLD
         self._channels[self.CH_THROTTLE] = self.RC_CENTER  # FC tự điều khiển
         self._send_rc()
 
-        # Tiếp tục gửi RC liên tục qua timer
+        # Tiếp tục gửi RC liên tục qua timer ở state SAFE_LANDING
         self._transition("SAFE_LANDING")
-        if not self._timer.isActive():
-            self._timer.start(self.TICK_INTERVAL_MS)
+        self._timer.start(self.TICK_INTERVAL_MS)
+        self.mode_activated.emit("Safe Land")
+
+    # ══════════════════════════════════════════════
+    # FORCE EMERGENCY COMMANDS — BYPASS STATE MACHINE
+    # ══════════════════════════════════════════════
+
+    def force_disarm(self):
+        """
+        FORCE DISARM — Lệnh khẩn cấp ưu tiên cao nhất.
+
+        Khác biệt với disarm() thường:
+        1. STOP timer TRƯỚC → ngăn tick ghi đè channels
+        2. Gửi sequence INAV-safe: tắt NAV modes → DISARM
+           (INAV bỏ qua DISARM khi đang ở NAV_TAKEOFF mode)
+        3. Gửi NHIỀU frame liên tiếp để đảm bảo FC nhận được
+        4. Sử dụng emergency queue (ưu tiên cao nhất)
+        """
+        # 1. STOP state machine NGAY LẬP TỨC
+        self._state = "IDLE"
+        self._timer.stop()
+
+        if not self._worker:
+            self._transition("IDLE")
+            self.mode_activated.emit("")
+            return
+
+        # 2. Frame 1: Tắt NAV modes (bypass INAV NAV_TAKEOFF protection)
+        #    INAV bỏ qua DISARM khi đang ở NAV mode → phải tắt NAV trước
+        nav_off_channels = [
+            self.RC_CENTER,         # Roll
+            self.RC_CENTER,         # Pitch
+            self.THROTTLE_MIN,      # Throttle — cắt ga
+            self.RC_CENTER,         # Yaw
+            self.AUX_ARM,           # AUX1 = vẫn ARM (chưa disarm)
+            self.AUX_ANGLE,         # AUX2 = ANGLE (tắt ALTHOLD/POSHOLD)
+            self.AUX_SAFE_LAND_OFF, # AUX3 = Safe Land OFF
+            self.AUX_RTH_OFF,       # AUX4 = RTH OFF
+        ]
+        self._channels = nav_off_channels
+        self._send_rc_emergency()   # Gửi qua emergency queue
+
+        # 3. Frame 2-3: DISARM (AUX1=1000)
+        self._channels = self._safe_channels()
+        self._send_rc_emergency()
+        self._send_rc_emergency()   # Gửi thêm 1 lần để đảm bảo
+
+        # 4. Chuyển state machine về IDLE
+        self._transition("IDLE")
+        self.status_update.emit("⛔ FORCE DISARM — Motor tắt")
+        self.mode_activated.emit("")
+
+    def force_safe_land(self):
+        """
+        FORCE SAFE LAND — Hạ cánh khẩn cấp ưu tiên cao.
+
+        Khác biệt với safe_land() thường:
+        1. STOP takeoff timer trước
+        2. Tắt NAV modes (bypass INAV NAV_TAKEOFF lock)
+        3. Kích hoạt Safe Land ngay lập tức
+        4. Khởi động lại timer ở state SAFE_LANDING
+        5. Sử dụng emergency queue (ưu tiên cao nhất)
+        """
+        # 1. STOP bất kỳ state machine nào đang chạy
+        self._state = "IDLE"
+        self._timer.stop()
+
+        if not self._worker:
+            self._transition("IDLE")
+            self.mode_activated.emit("")
+            return
+
+        # 2. Tắt NAV modes + kích hoạt Safe Land
+        self._channels = [
+            self.RC_CENTER,         # Roll
+            self.RC_CENTER,         # Pitch
+            self.RC_CENTER,         # Throttle — FC tự điều khiển
+            self.RC_CENTER,         # Yaw
+            self.AUX_ARM,           # AUX1 = Duy trì ARM
+            self.AUX_ANGLE,         # AUX2 = ANGLE (tắt NAV modes)
+            self.AUX_SAFE_LAND_ON,  # AUX3 = KÍCH HOẠT SAFE LAND
+            self.AUX_RTH_OFF,       # AUX4 = RTH OFF
+        ]
+        self._send_rc_emergency()   # Frame 1: Tắt NAV + bật Safe Land
+        self._send_rc_emergency()   # Frame 2: Đảm bảo
+
+        # 3. Chuyển sang state SAFE_LANDING và restart timer
+        self._transition("SAFE_LANDING")
+        self._timer.start(self.TICK_INTERVAL_MS)
+        self.status_update.emit("🛬 FORCE Safe Land — Đang hạ cánh...")
         self.mode_activated.emit("Safe Land")
 
     def rth(self):
@@ -281,6 +408,11 @@ class FlightController(QObject):
             frame = self._parser.pack_set_wp(wp_no, lat, lon, alt_cm, p1=0, p2=0, p3=p3)
             self._worker.send_command(frame)
 
+            # BUG-06 FIX: Delay nhỏ giữa các WP frames tránh flood TCP queue ESP32
+            # Với mission lớn (>20 WP), gửi liên tiếp có thể khiến ESP32 drop gói
+            if i < len(waypoints) - 1:  # Không delay sau frame cuối
+                time.sleep(self.WP_UPLOAD_DELAY_S)
+
             self.status_update.emit(
                 f"Upload WP {wp_no}/{len(waypoints)}: "
                 f"({lat:.6f}, {lon:.6f}) alt={wp['alt']:.0f}m"
@@ -312,6 +444,30 @@ class FlightController(QObject):
     def is_active(self) -> bool:
         """True nếu đang thực hiện chuỗi bay (không phải IDLE)."""
         return self._state != "IDLE"
+
+    @property
+    def _effective_altitude(self) -> float:
+        """
+        Sensor Fusion: Chọn nguồn độ cao tốt nhất hiện có.
+
+        Ưu tiên:
+        1. LiDAR MTF-02 khi: dữ liệu hợp lệ VÀ trong tầm đo (≤ LIDAR_MAX_RANGE_M)
+        2. Barometer (MSP_ALTITUDE) khi LiDAR ngoài tầm hoặc không có dữ liệu
+
+        INAV firmware đã tự sensor-fusion internally; property này chỉ dùng
+        cho GCS-side state machine (kiểm tra đạt độ cao mục tiêu, v.v.)
+
+        Returns:
+            float: Độ cao ước lượng tốt nhất (mét)
+        """
+        has_valid_lidar = (
+            self._drone_state.has_valid_surface
+            and 0.0 <= self._drone_state.surface_altitude <= self.LIDAR_MAX_RANGE_M
+        )
+        if has_valid_lidar:
+            return self._drone_state.surface_altitude
+        return self._drone_state.altitude
+
 
     # ══════════════════════════════════════════════
     # STATE MACHINE — VÒNG LẶP CHÍNH (10Hz)
@@ -345,11 +501,17 @@ class FlightController(QObject):
         elif self._state == "ARMED_WAIT":
             self._handle_armed_wait()
 
-        elif self._state == "THROTTLE_RAMP":
-            self._handle_throttle_ramp()
+        elif self._state == "WP_UPLOAD":
+            self._handle_wp_upload()
 
-        elif self._state == "ALT_HOLD_ENGAGE":
-            self._handle_alt_hold_engage()
+        elif self._state == "WP_ACTIVATE":
+            self._handle_wp_activate()
+
+        elif self._state == "NAV_CLIMB":
+            self._handle_nav_climb()
+
+        elif self._state == "ALTITUDE_REACHED":
+            self._handle_altitude_reached()
 
         elif self._state == "HOLDING":
             self._handle_holding()
@@ -366,17 +528,50 @@ class FlightController(QObject):
 
     def _handle_pre_arm_check(self):
         """Kiểm tra điều kiện an toàn trước khi ARM."""
+        # Quyết định cơ chế cất cánh: NAV WP (GPS) hay ALTHOLD fallback (indoor)
+        has_3d_fix = (
+            self._drone_state.gps_fix_type >= 2
+            and self._drone_state.gps_num_sat >= 6
+        )
+        
+        # Xác thực Cảm biến Cắt Lớp (Strict Sensor Validation)
+        has_sensors_ok = self._drone_state.sensor_opflow and self._drone_state.sensor_rangefinder
+        
+        self._use_nav_wp_takeoff = has_3d_fix and has_sensors_ok
+
+        if self._use_nav_wp_takeoff:
+            self.status_update.emit(
+                f"📡 GPS 3D Fix ({self._drone_state.gps_num_sat} sats) & Sensors OK — "
+                f"Sử dụng NAV WP Takeoff"
+            )
+        else:
+            reason = "GPS yếu" if not has_3d_fix else "Thiếu OptFlow/LiDAR"
+            self.status_update.emit(
+                f"⚠️ {reason} — Fallback ALTHOLD Takeoff (GCS điều khiển ga)"
+            )
+
         if self._drone_state.is_armed:
             # Đã ARM sẵn → skip thẳng sang cất cánh
-            self.status_update.emit("Drone đã ARM — bắt đầu cất cánh")
+            self.status_update.emit("Drone đã ARM — bắt đầu cất cánh...")
+            self._channels[self.CH_ROLL] = self.RC_CENTER
+            self._channels[self.CH_PITCH] = self.RC_CENTER
+            self._channels[self.CH_YAW] = self.RC_CENTER
             self._channels[self.CH_AUX1] = self.AUX_ARM
-            self._climb_start_time = time.time()
-            self._transition("THROTTLE_RAMP")
+            self._channels[self.CH_AUX2] = self.AUX_NAV_ALTHOLD_POSHOLD
+            self._channels[self.CH_AUX3] = self.AUX_SAFE_LAND_OFF
+            self._channels[self.CH_AUX4] = self.AUX_RTH_OFF
+            self._channels[self.CH_THROTTLE] = self.RC_CENTER
+            self._send_rc()
+
+            if self._use_nav_wp_takeoff:
+                self._wp_upload_time = time.time()
+                self._transition("WP_UPLOAD")
+            else:
+                self._climb_start_time = time.time()
+                self._transition("NAV_CLIMB")
             return
 
         # Đặt throttle thấp, tất cả kênh center — chuẩn bị ARM
-        # QUAN TRỌNG: Phải gửi DISARM (AUX1=1000) liên tục trước khi gạt ARM
-        # Đây là cơ chế bảo vệ INAV: Không cho phép cần gạt ở mức ARM khi khởi động
         self._channels = self._safe_channels()
         self._send_rc()
         self._arm_start_time = time.time()
@@ -464,62 +659,175 @@ class FlightController(QObject):
             )
 
     def _handle_armed_wait(self):
-        """Chờ drone ổn định 500ms sau khi ARM trước khi tăng ga."""
-        self._send_rc()  # Duy trì tín hiệu RC
-
-        if time.time() - self._armed_wait_start > self.ARMED_WAIT_S:
-            self._climb_start_time = time.time()
-            self._transition("THROTTLE_RAMP")
-            self.status_update.emit("Bắt đầu tăng ga — cất cánh...")
-
-    def _handle_throttle_ramp(self):
-        """Tăng dần throttle và theo dõi altitude từ barometer + GPS."""
-        current_throttle = self._channels[self.CH_THROTTLE]
-
-        # Tăng ga từ từ (mô phỏng người dùng gạt cần ga dần dần)
-        if current_throttle < self.THROTTLE_HOVER:
-            # Giai đoạn 1: Ramp nhanh tới hover point (10μs/tick)
-            self._channels[self.CH_THROTTLE] = min(
-                current_throttle + self.THROTTLE_RAMP_STEP,
-                self.THROTTLE_HOVER
-            )
-        elif current_throttle < self.THROTTLE_MAX_CLIMB:
-            # Giai đoạn 2: Tăng chậm nếu chưa đạt độ cao (5μs/tick)
-            self._channels[self.CH_THROTTLE] = min(
-                current_throttle + self.THROTTLE_FINE_STEP,
-                self.THROTTLE_MAX_CLIMB
-            )
-
+        """Chờ drone ổn định 500ms sau khi ARM trước khi cất cánh."""
+        # Duy trì AUX1=ARM liên tục trong lúc chờ ổn định
+        self._channels[self.CH_AUX1] = self.AUX_ARM
         self._send_rc()
 
-        # Cập nhật UI với thông tin thời gian thực (kết hợp Baro + GPS)
-        alt = self._drone_state.altitude
-        throttle = self._channels[self.CH_THROTTLE]
-        gps_fix = self._drone_state.gps_fix_type
-        num_sat = self._drone_state.gps_num_sat
-        self.status_update.emit(
-            f"Đang leo — Alt: {alt:.1f}m / {self._target_altitude:.0f}m | "
-            f"Throttle: {throttle}μs | GPS: {'3D' if gps_fix >= 2 else 'No Fix'} ({num_sat} sats)"
+        if time.time() - self._armed_wait_start > self.ARMED_WAIT_S:
+            # Bật ALTHOLD + POSHOLD
+            self._channels[self.CH_AUX2] = self.AUX_NAV_ALTHOLD_POSHOLD
+            self._channels[self.CH_THROTTLE] = self.RC_CENTER
+            self._send_rc()
+
+            if self._use_nav_wp_takeoff:
+                # ======= CHẾ ĐỘ MỚI: NAV WP TAKEOFF =======
+                # Upload 1 WP tại vị trí hiện tại với độ cao mục tiêu
+                self._wp_upload_time = time.time()
+                self._transition("WP_UPLOAD")
+                self.status_update.emit("📤 Đang upload WP cất cánh lên FC...")
+            else:
+                # ======= FALLBACK: ALTHOLD THROTTLE RAMP =======
+                # Không có GPS → dùng cách cũ (đẩy ga thủ công)
+                self._climb_start_time = time.time()
+                self._transition("NAV_CLIMB")
+                self.status_update.emit("ALTHOLD bật — GCS điều khiển cất cánh (fallback)...")
+
+    def _handle_wp_upload(self):
+        """
+        TRẠNG THÁI MỚI: Upload 1 Waypoint tại vị trí hiện tại + độ cao mục tiêu.
+
+        INAV nhận WP với flag 0xA5 (last WP) → khi bật NAV WP, INAV sẽ
+        tự động cất cánh và leo lên đúng độ cao đã chỉ định, sau đó hover tại chỗ.
+        Toàn bộ điều khiển bay vật lý do C++ của INAV xử lý ở 1000Hz.
+        """
+        # Duy trì ARM + ALTHOLD
+        self._channels[self.CH_AUX1] = self.AUX_ARM
+        self._channels[self.CH_THROTTLE] = self.RC_CENTER
+        self._send_rc()
+
+        # Lấy tọa độ GPS đã được làm mượt qua Moving Average Box (Chống trôi)
+        stable_gps = self._drone_state.get_stable_gps()
+
+        if not stable_gps:
+            self.status_update.emit("⏳ Đang thu thập mốc GPS ổn định (Anti-drift)...")
+            return
+            
+        lat, lon = stable_gps
+        alt_cm = int(self._target_altitude * 100)
+
+        if lat == 0.0 and lon == 0.0:
+            # GPS chưa có dữ liệu → fallback ALTHOLD
+            self.status_update.emit("⚠️ GPS chưa có tọa độ — fallback ALTHOLD")
+            self._use_nav_wp_takeoff = False
+            self._climb_start_time = time.time()
+            self._transition("NAV_CLIMB")
+            return
+
+        # Tạo WP: action=WAYPOINT(1), flag=0xA5 (last WP)
+        frame = self._parser.pack_set_wp(
+            wp_no=1, lat=lat, lon=lon, alt=alt_cm, p1=0, p2=0, p3=0xA5
         )
+        self._worker.send_command(frame)
+
+        self.status_update.emit(
+            f"✅ WP uploaded: ({lat:.6f}, {lon:.6f}) alt={self._target_altitude:.0f}m — "
+            f"Chờ kích hoạt NAV WP..."
+        )
+        self._wp_upload_time = time.time()
+        self._transition("WP_ACTIVATE")
+
+    def _handle_wp_activate(self):
+        """
+        TRẠNG THÁI MỚI: Chờ 1s rồi bật NAV WP mode.
+
+        Sau khi upload WP, cần chờ để INAV xử lý xong WP vào bộ nhớ.
+        Sau đó gạt AUX2=2000 (NAV WP) → INAV tự cất cánh.
+        """
+        self._channels[self.CH_AUX1] = self.AUX_ARM
+        self._channels[self.CH_THROTTLE] = self.RC_CENTER
+        self._send_rc()
+
+        if time.time() - self._wp_upload_time > self.NAV_WP_ACTIVATE_WAIT_S:
+            # Bật NAV WP → INAV tự động cất cánh
+            self._channels[self.CH_AUX2] = self.AUX_NAV_ALTHOLD_POSHOLD  # NAV WP cùng dải
+            self._channels[self.CH_THROTTLE] = self.RC_CENTER  # INAV tự điều khiển ga
+            self._climb_start_time = time.time()
+            self._send_rc()
+            self._transition("NAV_CLIMB")
+            self.status_update.emit(
+                f"🚀 NAV WP đã kích hoạt — INAV tự động cất cánh lên {self._target_altitude:.0f}m"
+            )
+
+    def _handle_nav_climb(self):
+        """
+        Trạng thái leo cao.
+
+        Nếu dùng NAV WP: INAV đã tự điều khiển hoàn toàn. GCS chỉ giám sát
+        độ cao từ telemetry và gửi RC giữ nguyên (throttle=1500) để duy trì
+        MSP override. INAV C++ PID 1000Hz tự tính toán ga, bù gió, phanh mượt.
+
+        Nếu fallback ALTHOLD: GCS đẩy throttle > 1500 để ra lệnh leo,
+        INAV PID vẫn điều khiển motor nhưng GCS chỉ định climb rate.
+        """
+        # An toàn: nếu FC tự DISARM giữa chừng (failsafe hardware, lỗi sensor)
+        if not self._drone_state.is_armed:
+            self._timer.stop()
+            self._channels = self._safe_channels()
+            self._send_rc()
+            self._transition("IDLE")
+            self.status_update.emit("Drone DISARM giữa chừng — dừng cất cánh")
+            self.mode_activated.emit("")
+            return
+
+        # Đọc độ cao tốt nhất: LiDAR MTF-02 nếu trong tầm, Barometer nếu không
+        alt = self._effective_altitude
+
+        if self._use_nav_wp_takeoff:
+            # ======= NAV WP MODE: INAV TỰ ĐIỀU KHIỂN =======
+            # GCS chỉ gửi RC center để duy trì override, KHÔNG can thiệp ga
+            self._channels[self.CH_AUX2] = self.AUX_NAV_ALTHOLD_POSHOLD
+            self._channels[self.CH_THROTTLE] = self.RC_CENTER
+            self._send_rc()
+
+            self.status_update.emit(
+                f"INAV đang cất cánh (NAV WP) — Alt: {alt:.1f}m / {self._target_altitude:.0f}m | "
+                f"GPS: {self._drone_state.gps_num_sat} sats"
+            )
+        else:
+            # ======= FALLBACK ALTHOLD: GCS ĐIỀU KHIỂN GA =======
+            # Vẫn giữ logic đẩy ga cũ cho bay indoor không GPS
+            distance_to_target = max(0.0, self._target_altitude - alt)
+
+            if distance_to_target < 1.0:
+                # Phanh mềm: Gần đích → giảm ga tỉ lệ
+                progress = distance_to_target / 1.0
+                target_throttle = int(self.RC_CENTER + (self.THROTTLE_CLIMB_CMD - self.RC_CENTER) * progress)
+            else:
+                # Khởi hành mềm: 1.5s đầu tiên tăng ga dần
+                elapsed_climb = time.time() - self._climb_start_time
+                ramp_duration = 1.5
+                if elapsed_climb < ramp_duration:
+                    progress = elapsed_climb / ramp_duration
+                    target_throttle = int(self.RC_CENTER + (self.THROTTLE_CLIMB_CMD - self.RC_CENTER) * progress)
+                else:
+                    target_throttle = self.THROTTLE_CLIMB_CMD
+
+            smoothed_throttle = max(1000, min(target_throttle, 2000))
+            self._channels[self.CH_AUX2] = self.AUX_NAV_ALTHOLD_POSHOLD
+            self._channels[self.CH_THROTTLE] = smoothed_throttle
+            self._send_rc()
+
+            self.status_update.emit(
+                f"ALTHOLD leo (fallback) — Alt: {alt:.1f}m / {self._target_altitude:.0f}m | Ga: {smoothed_throttle}μs"
+            )
 
         # Kiểm tra đạt độ cao mục tiêu
         if alt >= self._target_altitude - self.ALTITUDE_TOLERANCE:
-            self._transition("ALT_HOLD_ENGAGE")
+            self._transition("ALTITUDE_REACHED")
         elif time.time() - self._climb_start_time > self.CLIMB_TIMEOUT_S:
             self._abort(
                 f"Không đạt độ cao mục tiêu ({alt:.1f}m / "
                 f"{self._target_altitude:.0f}m) — timeout {self.CLIMB_TIMEOUT_S:.0f}s"
             )
 
-    def _handle_alt_hold_engage(self):
+    def _handle_altitude_reached(self):
         """
-        Bật NAV_ALTHOLD + NAV_POSHOLD khi đạt độ cao mục tiêu.
+        Đạt độ cao mục tiêu — đưa throttle về center để INAV giữ.
 
-        AUX2=2000 kích hoạt đồng thời:
-        - NAV ALTHOLD: Tự giữ độ cao bằng Baro
-        - NAV POSHOLD: Tự giữ vị trí bằng GPS BZ 251 + la bàn
-
-        Throttle về center (1500) vì FC tự điều khiển khi ở mode này.
+        Throttle = 1500 (center) trong ALTHOLD = lệnh "giữ độ cao hiện tại".
+        INAV PID tự lock độ cao + GPS BZ 251 lock vị trí (POSHOLD).
+        LiDAR MTF-02 hỗ trợ giữ chính xác hơn (INAV tự xử lý).
         """
         self._channels[self.CH_THROTTLE] = self.RC_CENTER
         self._channels[self.CH_AUX2] = self.AUX_NAV_ALTHOLD_POSHOLD
@@ -528,6 +836,7 @@ class FlightController(QObject):
         alt = self._drone_state.altitude
         lat = self._drone_state.latitude
         lon = self._drone_state.longitude
+
         self.status_update.emit(
             f"Giữ độ cao tại {alt:.1f}m ✓ — ALTHOLD+POSHOLD đã bật "
             f"| GPS: ({lat:.6f}, {lon:.6f})"
@@ -537,7 +846,12 @@ class FlightController(QObject):
         self.mode_activated.emit(f"Holding {alt:.1f}m")
 
     def _handle_holding(self):
-        """Duy trì trạng thái hover — gửi RC liên tục để giữ MSP override."""
+        """
+        Duy trì trạng thái hover — gửi RC liên tục để giữ MSP override.
+
+        INAV ALTHOLD + POSHOLD đang hoạt động, FC tự giữ độ cao và vị trí.
+        GCS chỉ cần duy trì tín hiệu RC và giám sát trạng thái ARM.
+        """
         self._send_rc()
 
         # Theo dõi an toàn: nếu FC tự DISARM → dừng
@@ -546,6 +860,7 @@ class FlightController(QObject):
             self._transition("IDLE")
             self.status_update.emit("Drone đã DISARM — kết thúc hold")
             self.mode_activated.emit("")
+            return
 
     def _handle_safe_landing(self):
         """
@@ -553,9 +868,13 @@ class FlightController(QObject):
 
         FC chiếm quyền điều khiển và hạ cánh. Khi chạm đất, FC tự DISARM.
         State machine chờ FC báo DISARMED rồi chuyển về IDLE.
+
+        INAV tự sử dụng LiDAR MTF-02 (nav_surface_control = AUTO) để hạ cánh
+        mượt mà — GCS không cần giám sát LiDAR thủ công.
         """
         # Duy trì tín hiệu Safe Land liên tục
         self._channels[self.CH_AUX3] = self.AUX_SAFE_LAND_ON
+        self._channels[self.CH_AUX2] = self.AUX_ANGLE  # Tránh xung đột với POSHOLD
         self._send_rc()
 
         # Theo dõi: khi FC tự DISARM (đã chạm đất) → kết thúc
@@ -598,6 +917,29 @@ class FlightController(QObject):
         payload = struct.pack('<8H', *self._channels)
         frame = self._parser.pack_msg(MSP_SET_RAW_RC, payload)
         self._worker.send_command(frame)
+
+    def _send_rc_emergency(self):
+        """
+        Gửi MSP_SET_RAW_RC qua emergency queue (ưu tiên cao nhất).
+
+        Xóa toàn bộ command queue thường và gửi ngay lập tức.
+        Dùng cho force_disarm() và force_safe_land().
+
+        Frame được gắn prefix "EM:" để ESP32 nhận diện lệnh khẩn cấp:
+        - ESP32 xóa UART input buffer (discard response cũ)
+        - Chuyển tiếp MSP frame ngay lập tức xuống FC
+        - Tắt failsafe state để không ghi đè lệnh emergency
+        """
+        if not self._worker:
+            return
+        payload = struct.pack('<8H', *self._channels)
+        frame = self._parser.pack_msg(MSP_SET_RAW_RC, payload)
+        # Gắn prefix EM: để ESP32 ưu tiên xử lý lệnh khẩn cấp
+        emergency_frame = b'EM:' + frame
+        if hasattr(self._worker, 'send_emergency_command'):
+            self._worker.send_emergency_command(emergency_frame)
+        else:
+            self._worker.send_command(emergency_frame)
 
     def _safe_channels(self) -> list[int]:
         """
