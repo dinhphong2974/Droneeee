@@ -47,6 +47,8 @@ class WifiWorker(QThread):
     # ── Signal giao tiếp với main.py ──
     connection_status = Signal(bool, str)  # (Thành công/Thất bại, Lời nhắn)
     telemetry_data = Signal(dict)          # Dữ liệu telemetry đã giải mã
+    ping_updated = Signal(int)             # RTT (ms) giữa GCS ↔ ESP32
+    command_acked = Signal(str)            # Loại ACK nhận từ ESP32 (RC/FS/EM)
 
     # ── Cấu hình tần số lấy mẫu ──
     POLLING_INTERVAL = 0.05  # 20Hz (50ms/lần)
@@ -76,6 +78,13 @@ class WifiWorker(QThread):
         # Emergency queue — ưu tiên cao nhất, được drain trước command_queue
         self._emergency_queue: Queue = Queue()
         self._emergency_abort = threading.Event()  # Cờ interrupt cho emergency
+
+        # ── PING/PONG latency measurement ──
+        self._ping_interval = 1.0        # Gửi PING mỗi 1 giây
+        self._last_ping_time = 0.0       # Thời điểm gửi PING lần cuối
+
+        # ── Text response buffer (PONG/ACK) ──
+        self._text_buffer = b''          # Buffer cho text response chưa hoàn chỉnh
 
         # ── Mock mode state ──
         self._mock_channels = [1500, 1500, 1000, 1500, 1000, 1500, 1000, 1000]
@@ -145,6 +154,13 @@ class WifiWorker(QThread):
         """Vòng lặp chính: kết nối ESP32 → gửi lệnh + hỏi telemetry → phát lên UI."""
         self._client = WifiClient(self.ip, self.port)
 
+        # BUG-08 FIX: Reset text buffer khi bắt đầu kết nối mới.
+        # Nếu kết nối trước bị đứt giữa chừng PONG packet, buffer giữ dữ liệu rác
+        # → khi kết nối lại sẽ merge với data mới → parse sai PONG timestamp.
+        self._text_buffer = b''
+        # Reset ping timer → PING được gửi ngay khi kết nối thay vì đợi 1s
+        self._last_ping_time = 0.0
+
         try:
             # Bước 1: Mở kết nối TCP tới ESP32
             self._client.connect()
@@ -162,6 +178,14 @@ class WifiWorker(QThread):
             # Bước 2: Vòng lặp hỏi-đáp liên tục
             while self.is_running:
                 try:
+                    # ── Gửi PING định kỳ (mỗi 1 giây) ──
+                    now = time.time()
+                    if now - self._last_ping_time >= self._ping_interval:
+                        ping_ts = int(now * 1000)  # ms timestamp
+                        ping_msg = f"PING:{ping_ts}".encode()
+                        self._client.send(ping_msg)
+                        self._last_ping_time = now
+
                     # ── Gửi lệnh điều khiển từ hàng đợi (nếu có) ──
                     self._drain_command_queue()
 
@@ -173,8 +197,14 @@ class WifiWorker(QThread):
                     # ESP/FC ĐÁP: Nhận dữ liệu thô từ TCP
                     raw_data = self._client.receive()
 
-                    # GIẢI MÃ: Ném data thô vào parser để bóc tách
-                    parsed_dict = self._parser.parse_buffer(raw_data)
+                    # TÁCH STREAM: Text (PONG/ACK) vs Binary (MSP)
+                    msp_data = self._extract_text_responses(raw_data)
+
+                    # GIẢI MÃ MSP: Ném data thô vào parser để bóc tách
+                    if msp_data:
+                        parsed_dict = self._parser.parse_buffer(msp_data)
+                    else:
+                        parsed_dict = None
 
                     # Nếu có dữ liệu hợp lệ, phát lên UI
                     if parsed_dict:
@@ -197,6 +227,67 @@ class WifiWorker(QThread):
             self.connection_status.emit(False, f"Lỗi mạng: {str(e)}")
         finally:
             self._close_connection()
+
+    def _extract_text_responses(self, raw_data: bytes) -> bytes:
+        """
+        Tách text responses (PONG/ACK) và binary MSP data từ TCP stream.
+
+        ESP32 gửi 2 loại data trên cùng 1 TCP stream:
+        - Text: PONG:<ts>\\n, ACK:<type>\\n — kết thúc bằng newline
+        - Binary: $M> MSP response — không có newline marker
+
+        Method này tách text, xử lý ngay (emit signal), và trả về
+        phần binary còn lại cho MSP parser.
+
+        Args:
+            raw_data: Bytes thô nhận từ TCP
+
+        Returns:
+            bytes: Phần binary (MSP) còn lại sau khi loại bỏ text
+        """
+        if not raw_data:
+            return b''
+
+        # Gộp với buffer chưa hoàn chỉnh từ lần trước
+        data = self._text_buffer + raw_data
+        self._text_buffer = b''
+
+        msp_parts = []
+        i = 0
+
+        while i < len(data):
+            # Kiểm tra text prefix
+            if data[i:i+5] == b'PONG:' or data[i:i+4] == b'ACK:':
+                # Tìm newline kết thúc text line
+                nl_pos = data.find(b'\n', i)
+                if nl_pos == -1:
+                    # Chưa nhận đủ → lưu buffer chờ lần sau
+                    self._text_buffer = data[i:]
+                    break
+
+                line = data[i:nl_pos].decode(errors='ignore').strip()
+
+                if line.startswith('PONG:'):
+                    # Tính RTT từ timestamp gốc
+                    try:
+                        sent_ts = int(line[5:])
+                        rtt = int(time.time() * 1000) - sent_ts
+                        if 0 <= rtt < 5000:  # Bỏ giá trị bất thường
+                            self.ping_updated.emit(rtt)
+                    except (ValueError, OverflowError):
+                        pass
+
+                elif line.startswith('ACK:'):
+                    ack_type = line[4:]
+                    self.command_acked.emit(ack_type)
+
+                i = nl_pos + 1  # Bỏ qua newline
+            else:
+                # Binary data (MSP) — giữ lại
+                msp_parts.append(data[i:i+1])
+                i += 1
+
+        return b''.join(msp_parts)
 
     def _drain_command_queue(self):
         """Gửi lệnh: emergency queue trước, command queue sau."""

@@ -284,6 +284,8 @@ class GCSApp(MainWindow):
         # Kết nối Signal từ worker tới các slot xử lý trên UI
         self.worker.connection_status.connect(self.handle_connection_status)
         self.worker.telemetry_data.connect(self.update_telemetry_ui)
+        self.worker.ping_updated.connect(self._on_ping_updated)
+        self.worker.command_acked.connect(self._on_command_acked)
 
         # Cấp worker cho FlightController để gửi lệnh
         self.flight_controller.set_worker(self.worker)
@@ -582,6 +584,10 @@ class GCSApp(MainWindow):
         self.lbl_wifi_icon.setText("📶 Mất kết nối")
         self.lbl_wifi_icon.setStyleSheet("color: gray;")
 
+        # Reset ping label về trạng thái chưa đo
+        self.lbl_ping.setText("🏓 ---ms")
+        self.lbl_ping.setStyleSheet("color: #808098;")
+
         self.btn_disconnect.setText("Kết nối")
         self.btn_disconnect.setStyleSheet(
             "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; border-radius: 4px; }"
@@ -712,6 +718,49 @@ class GCSApp(MainWindow):
         else:
             self.emergency_overlay.hide_overlay()
             self.drone_state.active_mode_name = ""
+
+    def _on_ping_updated(self, rtt_ms: int):
+        """
+        Slot: Nhận RTT mới từ WifiWorker, cập nhật ping label trên top bar.
+
+        Màu sắc theo chất lượng:
+          • Xanh lá  (≤50ms)  : Tốt
+          • Vàng     (≤150ms) : Trung bình
+          • Cam      (≤300ms) : Chậm
+          • Đỏ       (>300ms) : Kém
+        """
+        self.drone_state.ping_rtt_ms = rtt_ms
+        self.lbl_ping.setText(f"🏓 {rtt_ms}ms")
+        if rtt_ms <= 50:
+            color = "#4CAF50"   # xanh lá — tốt
+        elif rtt_ms <= 150:
+            color = "#FFC107"   # vàng — trung bình
+        elif rtt_ms <= 300:
+            color = "#FF9800"   # cam — chậm
+        else:
+            color = "#F44336"   # đỏ — kém
+        self.lbl_ping.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def _on_command_acked(self, ack_type: str):
+        """
+        Slot: ESP32 đã xác nhận nhận lệnh — hiển thị trên flight status.
+
+        ACK types:
+          • RC  : Lệnh RC đã gửi tới FC
+          • FS  : Cấu hình failsafe đã lưu
+          • EM  : Lệnh khẩn cấp đã thực thi
+        """
+        type_labels = {
+            "RC": "✓ RC",
+            "FS": "✓ Failsafe config",
+            "EM": "✓ Emergency cmd",
+        }
+        label = type_labels.get(ack_type, f"✓ ACK:{ack_type}")
+        # Chỉ hiển thị trên status nếu không phải RC (RC quá nhiều sẽ gây nhấp nháy)
+        if ack_type != "RC":
+            mc = self.manual_control_tab
+            mc.val_flight_status.setText(label)
+            mc.val_flight_status.setStyleSheet("color: #00E676; font-weight: bold;")
 
     # ══════════════════════════════════════════════
     # EMERGENCY OVERLAY — NÚT KHẨN CẤP

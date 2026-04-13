@@ -39,7 +39,6 @@ KHÔNG truy cập trực tiếp socket hay widget UI.
 """
 
 import time
-import struct
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from comm.msp_parser import MSPParser, MSP_SET_RAW_RC, MSP_SET_WP
@@ -100,11 +99,14 @@ class FlightController(QObject):
 
     # ── Timeout ──
     TICK_INTERVAL_MS = 100          # Tần số state machine (10Hz)
-    RC_LINK_WAIT_S = 1.5            # Chờ INAV reset ARM_SWITCH safety (giây)
+    RC_LINK_WAIT_S = 2.0            # Chờ INAV reset ARM_SWITCH safety (giây)
                                     # INAV cần thấy AUX1=DISARM liên tục ≥1s trước khi cho phép ARM
     ARM_TIMEOUT_S = 5.0             # Timeout chờ ARM (giây) — tăng lên để chắc chắn
     CLIMB_TIMEOUT_S = 15.0          # Timeout đạt độ cao (giây)
     ARMED_WAIT_S = 0.5              # Chờ ổn định sau ARM (giây)
+    DISARM_TIMEOUT_S = 5.0          # Timeout chờ DISARM xác nhận (giây)
+    SAFE_LAND_TIMEOUT_S = 120.0     # Timeout Safe Land — INAV hạ cánh chậm nhất ~2 phút
+    RTH_TIMEOUT_S = 300.0           # Timeout RTH — drone có thể bay xa, cần đủ thời gian
 
     # ── LiDAR MTF-02 — Sensor Fusion ──
     LIDAR_MAX_RANGE_M = 2.5         # Tầm đo tối đa MTF-02 AIO (2.5m)
@@ -152,6 +154,9 @@ class FlightController(QObject):
         self._armed_wait_start = 0.0
         self._climb_start_time = 0.0
         self._wp_upload_time = 0.0
+        self._disarm_start_time = 0.0
+        self._safe_land_start_time = 0.0  # BUG-06 FIX: timeout SAFE_LANDING
+        self._rth_start_time = 0.0        # BUG-06 FIX: timeout RTH_ACTIVE
 
         # ── Takeoff mode ──
         self._use_nav_wp_takeoff = True  # Mặc định dùng NAV WP; chuyển False nếu GPS yếu
@@ -195,14 +200,35 @@ class FlightController(QObject):
         self.mode_activated.emit("ARM")
 
     def disarm(self):
-        """DISARM drone — tắt AUX, hạ ga, dừng state machine."""
-        self._state = "IDLE"  # Set state TRƯỚC để tick cuối (nếu có) sẽ tự dừng
+        """
+        DISARM drone — chuyển sang state DISARMING để gửi liên tục (repeated-send).
+
+        Phiên bản mới (FIX): Thay vì fire-and-forget (gửi 1 frame rồi dừng timer),
+        chuyển sang state DISARMING → timer 10Hz tiếp tục gửi DISARM frame
+        cho đến khi FC xác nhận is_armed=False hoặc timeout 5 giây.
+
+        Lý do: INAV có thể từ chối DISARM nếu đang ở NAV mode. State machine
+        đảm bảo lệnh DISARM được gửi liên tục cho đến khi có hiệu lực.
+        """
+        # Dừng state machine hiện tại (nếu đang chạy)
+        self._state = "IDLE"
         self._timer.stop()
+
+        if not self._worker:
+            self._transition("IDLE")
+            self.mode_activated.emit("")
+            return
+
+        # Gửi ngay 1 frame DISARM đầu tiên
         self._channels = self._safe_channels()
         self._send_rc()
-        self._transition("IDLE")
-        self.status_update.emit("Đã gửi lệnh DISARM")
-        self.mode_activated.emit("")  # Tắt overlay
+
+        # Chuyển sang state DISARMING — timer tiếp tục gửi liên tục
+        self._disarm_start_time = time.time()
+        self._transition("DISARMING")
+        self._timer.start(self.TICK_INTERVAL_MS)
+        self.status_update.emit("Đang DISARM — đang chờ FC xác nhận...")
+        self.mode_activated.emit("")  # Tắt overlay ngay
 
     def takeoff_and_hold(self, target_alt: float = 3.0):
         """
@@ -253,6 +279,7 @@ class FlightController(QObject):
         self._send_rc()
 
         # Tiếp tục gửi RC liên tục qua timer ở state SAFE_LANDING
+        self._safe_land_start_time = time.time()  # BUG-06 FIX
         self._transition("SAFE_LANDING")
         self._timer.start(self.TICK_INTERVAL_MS)
         self.mode_activated.emit("Safe Land")
@@ -265,24 +292,25 @@ class FlightController(QObject):
         """
         FORCE DISARM — Lệnh khẩn cấp ưu tiên cao nhất.
 
-        Khác biệt với disarm() thường:
+        Phiên bản mới: Gửi emergency frame + chuyển sang state FORCE_DISARMING
+        để gửi DISARM liên tục cho đến khi FC xác nhận.
+
         1. STOP timer TRƯỚC → ngăn tick ghi đè channels
         2. Gửi sequence INAV-safe: tắt NAV modes → DISARM
-           (INAV bỏ qua DISARM khi đang ở NAV_TAKEOFF mode)
-        3. Gửi NHIỀU frame liên tiếp để đảm bảo FC nhận được
-        4. Sử dụng emergency queue (ưu tiên cao nhất)
+        3. Gửi NHIỀU frame liên tiếp qua emergency queue
+        4. Bật timer lại ở state FORCE_DISARMING để gửi DISARM liên tục
         """
         # 1. STOP state machine NGAY LẬP TỨC
-        self._state = "IDLE"
+        self._state = "FORCE_DISARMING"
         self._timer.stop()
 
         if not self._worker:
+            self._state = "IDLE"
             self._transition("IDLE")
             self.mode_activated.emit("")
             return
 
         # 2. Frame 1: Tắt NAV modes (bypass INAV NAV_TAKEOFF protection)
-        #    INAV bỏ qua DISARM khi đang ở NAV mode → phải tắt NAV trước
         nav_off_channels = [
             self.RC_CENTER,         # Roll
             self.RC_CENTER,         # Pitch
@@ -294,17 +322,20 @@ class FlightController(QObject):
             self.AUX_RTH_OFF,       # AUX4 = RTH OFF
         ]
         self._channels = nav_off_channels
-        self._send_rc_emergency()   # Gửi qua emergency queue
+        self._send_rc_emergency()
 
         # 3. Frame 2-3: DISARM (AUX1=1000)
         self._channels = self._safe_channels()
         self._send_rc_emergency()
-        self._send_rc_emergency()   # Gửi thêm 1 lần để đảm bảo
+        self._send_rc_emergency()
 
-        # 4. Chuyển state machine về IDLE
-        self._transition("IDLE")
-        self.status_update.emit("⛔ FORCE DISARM — Motor tắt")
+        # 4. Chuyển state machine sang FORCE_DISARMING để gửi DISARM liên tục
+        self._disarm_start_time = time.time()
+        self._transition("FORCE_DISARMING")
+        self.status_update.emit("⛔ FORCE DISARM — đang chờ xác nhận...")
         self.mode_activated.emit("")
+        # Bật timer lại để tiếp tục gửi DISARM
+        self._timer.start(self.TICK_INTERVAL_MS)
 
     def force_safe_land(self):
         """
@@ -341,6 +372,7 @@ class FlightController(QObject):
         self._send_rc_emergency()   # Frame 2: Đảm bảo
 
         # 3. Chuyển sang state SAFE_LANDING và restart timer
+        self._safe_land_start_time = time.time()  # BUG-06 FIX
         self._transition("SAFE_LANDING")
         self._timer.start(self.TICK_INTERVAL_MS)
         self.status_update.emit("🛬 FORCE Safe Land — Đang hạ cánh...")
@@ -369,6 +401,7 @@ class FlightController(QObject):
         self._send_rc()
 
         # Tiếp tục gửi RC liên tục qua timer
+        self._rth_start_time = time.time()  # BUG-06 FIX
         self._transition("RTH_ACTIVE")
         if not self._timer.isActive():
             self._timer.start(self.TICK_INTERVAL_MS)
@@ -522,6 +555,12 @@ class FlightController(QObject):
         elif self._state == "RTH_ACTIVE":
             self._handle_rth_active()
 
+        elif self._state == "DISARMING":
+            self._handle_disarming()
+
+        elif self._state == "FORCE_DISARMING":
+            self._handle_force_disarming()
+
     # ══════════════════════════════════════════════
     # XỬ LÝ TỪNG TRẠNG THÁI
     # ══════════════════════════════════════════════
@@ -588,17 +627,26 @@ class FlightController(QObject):
 
         Tương tự như khi người dùng gạt cần gạt từ từ:
         - Khởi động → cần gạt ở mức thấp (DISARM)
-        - Chờ 1.5 giây
+        - Chờ 2.0 giây
         - Gạt lên mức cao (ARM)
+
+        QUAN TRỌNG: Ở tick chuyển trạng thái (elapsed > RC_LINK_WAIT_S),
+        KHÔNG gửi RC frame. Nếu gửi DISARM ở tick này, WifiWorker có thể
+        gộp frame DISARM và frame ARM (tick kế tiếp) vào cùng 1 lần drain
+        queue khi bị block bởi receive() → INAV thấy DISARM→ARM trong vài μs
+        → ARMING_DISABLED_ARM_SWITCH không kịp clear → ARM thất bại.
         """
-        self._send_rc()
         elapsed = time.time() - self._arm_start_time
-        remaining = max(0.0, self.RC_LINK_WAIT_S - elapsed)
-        self.status_update.emit(f"Khởi tạo RC link... ({remaining:.1f}s)")
         if elapsed > self.RC_LINK_WAIT_S:
+            # Chuyển trạng thái — KHÔNG gửi RC để tránh batching DISARM+ARM
             self._arm_start_time = time.time()
             self._transition("ARMING")
             self.status_update.emit("Đang gửi lệnh ARM...")
+        else:
+            # Gửi DISARM liên tục để INAV thấy cần gạt ở vị trí thấp
+            self._send_rc()
+            remaining = max(0.0, self.RC_LINK_WAIT_S - elapsed)
+            self.status_update.emit(f"Khởi tạo RC link... ({remaining:.1f}s)")
 
     def _handle_wait_rc_link_arm_only(self):
         """
@@ -606,15 +654,19 @@ class FlightController(QObject):
 
         Xem giải thích tại _handle_wait_rc_link.
         Cùng cơ chế an toàn: phải "gạt từ từ" — gửi DISARM trước rồi mới ARM.
+        KHÔNG gửi RC ở tick chuyển trạng thái để tránh batching.
         """
-        self._send_rc()
         elapsed = time.time() - self._arm_start_time
-        remaining = max(0.0, self.RC_LINK_WAIT_S - elapsed)
-        self.status_update.emit(f"Khởi tạo RC link... ({remaining:.1f}s)")
         if elapsed > self.RC_LINK_WAIT_S:
+            # Chuyển trạng thái — KHÔNG gửi RC để tránh batching DISARM+ARM
             self._arm_start_time = time.time()
             self._transition("ARMING_ONLY")
             self.status_update.emit("Đang gửi lệnh ARM...")
+        else:
+            # Gửi DISARM liên tục
+            self._send_rc()
+            remaining = max(0.0, self.RC_LINK_WAIT_S - elapsed)
+            self.status_update.emit(f"Khởi tạo RC link... ({remaining:.1f}s)")
 
     def _handle_arming(self):
         """Gửi AUX1=HIGH liên tục và chờ FC xác nhận ARM qua MSP_STATUS."""
@@ -716,7 +768,7 @@ class FlightController(QObject):
 
         # Tạo WP: action=WAYPOINT(1), flag=0xA5 (last WP)
         frame = self._parser.pack_set_wp(
-            wp_no=1, lat=lat, lon=lon, alt=alt_cm, p1=0, p2=0, p3=0xA5
+            wp_no=1, lat=lat, lon=lon, alt_cm=alt_cm, p1=0, p2=0, p3=0xA5
         )
         self._worker.send_command(frame)
 
@@ -885,6 +937,20 @@ class FlightController(QObject):
             self._transition("IDLE")
             self.status_update.emit("Hạ cánh thành công ✓ — Đã DISARM")
             self.mode_activated.emit("")
+            return
+
+        # BUG-06 FIX: Timeout bảo vệ — nếu FC không tự DISARM sau SAFE_LAND_TIMEOUT_S
+        # (ví dụ INAV safe land fail hoặc LiDAR lỗi)
+        elapsed = time.time() - self._safe_land_start_time
+        if elapsed > self.SAFE_LAND_TIMEOUT_S:
+            self._timer.stop()
+            self._channels = self._safe_channels()
+            self._send_rc()
+            self._transition("IDLE")
+            self.error_occurred.emit(
+                f"⚠️ Safe Land timeout {self.SAFE_LAND_TIMEOUT_S:.0f}s — FC chưa xác nhận!\n"
+                "Kiểm tra INAV và trạng thái phần cứng trước khi tiếp cận drone."
+            )
 
     def _handle_rth_active(self):
         """
@@ -905,6 +971,95 @@ class FlightController(QObject):
             self._transition("IDLE")
             self.status_update.emit("RTH hoàn tất ✓ — Đã về Home và DISARM")
             self.mode_activated.emit("")
+            return
+
+        # BUG-06 FIX: Timeout bảo vệ — drone có thể bay rất xa, nhưng không vô hạn
+        elapsed = time.time() - self._rth_start_time
+        if elapsed > self.RTH_TIMEOUT_S:
+            self._timer.stop()
+            self._transition("IDLE")
+            self.error_occurred.emit(
+                f"⚠️ RTH timeout {self.RTH_TIMEOUT_S:.0f}s — FC chưa về được!\n"
+                "Kiểm tra GPS lock và tín hiệu WiFi toàn bộ hành trình."
+            )
+
+    def _handle_disarming(self):
+        """
+        Trạng thái DISARMING — gửi lệnh DISARM liên tục (10Hz) cho đến khi FC xác nhận.
+
+        FIX: Thay thế fire-and-forget đã gây delay 10-20s. Drone không thể bị
+        bỏ quên ở trạng thái armed — state machine này đảm bảo DISARM luôn có hiệu lực.
+
+        Luồng:
+        1. Mỗi tick: gửi DISARM frame qua command queue
+        2. Nếu is_armed == False → DISARM thành công, dừng timer → IDLE
+        3. Nếu timeout 5s → cảnh báo lỗi (drone có thể đang failsafe)
+        """
+        # Tiếp tục gửi DISARM mỗi tick (10Hz)
+        self._channels = self._safe_channels()
+        self._send_rc()
+
+        # Kiểm tra FC đã xác nhận DISARM chưa
+        if not self._drone_state.is_armed:
+            self._timer.stop()
+            self._transition("IDLE")
+            self.status_update.emit("DISARM thành công ✓")
+            return
+
+        # Kiểm tra timeout
+        elapsed = time.time() - self._disarm_start_time
+        if elapsed > self.DISARM_TIMEOUT_S:
+            self._timer.stop()
+            self._transition("IDLE")
+            self.error_occurred.emit(
+                f"⚠️ DISARM timeout {self.DISARM_TIMEOUT_S:.0f}s — FC chưa xác nhận!\n"
+                "Drone có thể đang ở failsafe mode. Kiểm tra kết nối WiFi và\n"
+                "trạng thái INAV trước khi tiếp cận drone."
+            )
+            return
+
+        # Thông báo tiến trình
+        remaining = max(0.0, self.DISARM_TIMEOUT_S - elapsed)
+        self.status_update.emit(f"Đang DISARM... ({remaining:.1f}s còn lại)")
+
+    def _handle_force_disarming(self):
+        """
+        Trạng thái FORCE_DISARMING — gửi DISARM khẩn cấp liên tục qua emergency queue.
+
+        FIX: Cùng cơ chế repeated-send như DISARMING, nhưng dùng emergency queue
+        để bypass mọi lệnh thường đang chờ. Đây là lệnh cao nhất, không thể bị preempt.
+
+        Luồng:
+        1. Mỗi tick: gửi DISARM frame qua emergency queue (ưu tiên cao nhất)
+        2. Nếu is_armed == False → DISARM thành công → IDLE
+        3. Nếu timeout 5s → cảnh báo nghiêm trọng
+        """
+        # Gửi DISARM khẩn cấp qua emergency queue
+        self._channels = self._safe_channels()
+        self._send_rc_emergency()
+
+        # Kiểm tra FC đã xác nhận DISARM chưa
+        if not self._drone_state.is_armed:
+            self._timer.stop()
+            self._transition("IDLE")
+            self.status_update.emit("⛔ FORCE DISARM thành công ✓")
+            return
+
+        # Kiểm tra timeout
+        elapsed = time.time() - self._disarm_start_time
+        if elapsed > self.DISARM_TIMEOUT_S:
+            self._timer.stop()
+            self._transition("IDLE")
+            self.error_occurred.emit(
+                f"🚨 FORCE DISARM timeout {self.DISARM_TIMEOUT_S:.0f}s — FC KHÔNG phản hồi!\n"
+                "NGUY HIỂM: Drone có thể vẫn đang ARM. Cần can thiệp thủ công khẩn cấp!"
+            )
+            return
+
+        # Thông báo tiến trình
+        elapsed = time.time() - self._disarm_start_time
+        remaining = max(0.0, self.DISARM_TIMEOUT_S - elapsed)
+        self.status_update.emit(f"⛔ FORCE DISARM... ({remaining:.1f}s còn lại)")
 
     # ══════════════════════════════════════════════
     # HÀM NỘI BỘ
@@ -914,8 +1069,7 @@ class FlightController(QObject):
         """Gửi MSP_SET_RAW_RC với giá trị kênh hiện tại qua WifiWorker."""
         if not self._worker:
             return
-        payload = struct.pack('<8H', *self._channels)
-        frame = self._parser.pack_msg(MSP_SET_RAW_RC, payload)
+        frame = self._parser.pack_set_raw_rc(self._channels)
         self._worker.send_command(frame)
 
     def _send_rc_emergency(self):
@@ -932,8 +1086,7 @@ class FlightController(QObject):
         """
         if not self._worker:
             return
-        payload = struct.pack('<8H', *self._channels)
-        frame = self._parser.pack_msg(MSP_SET_RAW_RC, payload)
+        frame = self._parser.pack_set_raw_rc(self._channels)
         # Gắn prefix EM: để ESP32 ưu tiên xử lý lệnh khẩn cấp
         emergency_frame = b'EM:' + frame
         if hasattr(self._worker, 'send_emergency_command'):

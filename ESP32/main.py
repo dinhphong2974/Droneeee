@@ -6,9 +6,9 @@ import struct
 import gc
 
 # ══════════════════════════════════════════════════════════════
-# 1. CẤU HÌNH UART (Giao tiếp với mạch FC SpeedyBee F405)
+# 1. CẤU HÌNH UART (Giao tiếp với mạch FC SpeedyBee F405 - cắm vào UART3 của FC)
 # ══════════════════════════════════════════════════════════════
-# Sử dụng UART1, chân TX=17, RX=16 (theo sơ đồ chân ESP32)
+# Trên ESP32: Sử dụng UART1 phần cứng, chân TX=17, RX=16
 # rxbuf=512: tăng buffer để chứa nhiều MSP response hơn
 # (GCS poll 6 lệnh: ANALOG, ATTITUDE, ALTITUDE, STATUS, RAW_GPS, SONAR_ALTITUDE)
 uart = machine.UART(1, baudrate=115200, tx=17, rx=16, rxbuf=512)
@@ -86,9 +86,11 @@ MSP_SET_RAW_RC = 200  # Mã lệnh gửi 8 kênh RC xuống FC
 # PC gửi "FS:rth" hoặc "FS:ignore" để cấu hình hành vi failsafe
 # PC gửi "EM:<MSP frame>" cho lệnh khẩn cấp ưu tiên cao nhất
 # PC gửi "HB:" như heartbeat giữ kết nối sống
+# PC gửi "PING:<timestamp>" để đo latency, ESP32 phản hồi "PONG:<timestamp>"
 FS_PREFIX = b'FS:'
 EMERGENCY_PREFIX = b'EM:'
 HEARTBEAT_PREFIX = b'HB:'
+PING_PREFIX = b'PING:'
 
 # ── Biến trạng thái ──
 conn = None                    # Kết nối TCP hiện tại
@@ -358,20 +360,49 @@ while True:
                 # Priority 1: EMERGENCY — Lệnh khẩn cấp (DISARM/Safe Land)
                 if handle_emergency(data_from_pc):
                     last_msg_time = time.ticks_ms()
+                    # ACK xác nhận ESP32 đã nhận và xử lý lệnh khẩn cấp
+                    try:
+                        conn.send(b'ACK:EM\n')
+                    except:
+                        pass
 
                 # Priority 2: FAILSAFE CONFIG — Cấu hình hành vi mất WiFi
                 elif check_failsafe_config(data_from_pc):
                     last_msg_time = time.ticks_ms()
+                    # ACK xác nhận ESP32 đã nhận cấu hình failsafe
+                    try:
+                        conn.send(b'ACK:FS\n')
+                    except:
+                        pass
 
-                # Priority 3: HEARTBEAT — Giữ kết nối sống
+                # Priority 3: PING — Đo latency GCS ↔ ESP32
+                elif data_from_pc.startswith(PING_PREFIX):
+                    last_msg_time = time.ticks_ms()
+                    # Phản hồi PONG với timestamp gốc từ GCS để tính RTT
+                    try:
+                        pong_reply = b'PONG:' + data_from_pc[len(PING_PREFIX):] + b'\n'
+                        conn.send(pong_reply)
+                    except:
+                        pass
+
+                # Priority 4: HEARTBEAT — Giữ kết nối sống
                 elif data_from_pc.startswith(HEARTBEAT_PREFIX):
                     last_msg_time = time.ticks_ms()
                     # Heartbeat không cần chuyển tiếp xuống FC
 
-                # Priority 4: MSP DATA — Chuyển tiếp bình thường xuống FC
+                # Priority 5: MSP DATA — Chuyển tiếp bình thường xuống FC
                 else:
                     uart.write(data_from_pc)
                     last_msg_time = time.ticks_ms()
+                    # ACK cho lệnh RC (MSP_SET_RAW_RC cmd=200)
+                    # Chỉ ACK lệnh RC, KHÔNG ACK telemetry poll (volume quá cao)
+                    if data_from_pc[:3] == b'$M<' and len(data_from_pc) >= 5:
+                        cmd_byte = data_from_pc[4]  # Byte thứ 5 = command ID
+                        if cmd_byte == 200:  # MSP_SET_RAW_RC
+                            try:
+                                conn.send(b'ACK:RC\n')
+                            except:
+                                pass
 
                 # ═══ RESET FAILSAFE KHI NHẬN TÍN HIỆU TỪ PC ═══
                 # Bất kỳ data nào từ PC (kể cả heartbeat) đều chứng minh

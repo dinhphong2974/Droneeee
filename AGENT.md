@@ -2,35 +2,36 @@
 
 > **Mục đích**: Cung cấp toàn bộ bối cảnh dự án cho AI agent. Đọc file này TRƯỚC khi code bất kỳ thứ gì.
 >
-> **Cập nhật lần cuối**: 2026-04-10
+> **Cập nhật lần cuối**: 2026-04-13
 
 ---
 
 ## 1. Tổng Quan Dự Án
 
-**DroneGCS** là ứng dụng Ground Control Station (Trạm điều khiển mặt đất) viết bằng **Python + PySide6 (Qt 6)**, dùng để giám sát và điều khiển drone qua giao thức **MSP (MultiWii Serial Protocol)**.
+**DroneGCS** là ứng dụng Ground Control Station (GCS) viết bằng **Python + PySide6 (Qt 6)**, điều khiển drone qua giao thức **MSP (MultiWii Serial Protocol)**.
 
 ### Chuỗi kết nối phần cứng
 
 ```
-[PC chạy DroneGCS]  ←── TCP/Wifi ──→  [ESP32 (cầu nối)]  ←── UART ──→  [Flight Controller chạy INAV]
+[PC DroneGCS] ←── TCP/WiFi ──→ [ESP32 AP] ←── UART ──→ [FC INAV (SpeedyBee F405)]
 ```
 
-- **ESP32 hoạt động như Access Point Wifi**, tạo mạng riêng (`Drone_GCS_Wifi`), password: `DroneGCS@2026!`, IP mặc định `192.168.4.1:8080`
-- ESP32 là **cầu nối + failsafe chủ động**: nhận TCP từ PC → chuyển UART xuống FC, nhận UART từ FC → chuyển TCP lên PC
-- **Active Failsafe**: Nếu mất tín hiệu PC > 2.0 giây → tự gửi `MSP_SET_RAW_RC` với AUX4=2000 (RTH) qua UART. Bất kể failsafe, **TCP socket luôn được giữ mở** để GCS có quyền khôi phục.
-- **Emergency Protocol**: GCS có thể gửi frame với prefix `EM:` (VD: `b"EM:$M<..."`). ESP32 sẽ lập tức xóa UART buffer cũ, chuyển tiếp ngay lập tức xuống FC và tắt failsafe, đảm bảo độ trễ thấp nhất cho lệnh Khẩn cấp.
-- **GPS + La bàn**: BZ 251 kết nối trực tiếp vào FC, cung cấp tọa độ GPS qua MSP_RAW_GPS
-- **LiDAR + Optical Flow**: Micoair MTF-02 AIO kết nối trực tiếp vào FC qua UART (MSP protocol), cung cấp rangefinder altitude (≤2.5m) và optical flow
+| Thiết bị | Vai trò |
+|---|---|
+| PC / GCS | Giao diện điều khiển, lập trình mission, giám sát |
+| ESP32 | WiFi Access Point + cầu nối TCP↔UART + failsafe chủ động |
+| FC INAV | Bay tự động, ARM/DISARM, GPS navigation, sensor fusion |
+| GPS BZ 251 | UART5 của FC, cung cấp tọa độ qua MSP_RAW_GPS |
+| LiDAR+OptFlow MTF-02 | UART6 của FC (giao thức MSP), rangefinder + optical flow |
 
 ### Tech Stack
 
 | Thành phần | Công nghệ |
 |---|---|
-| GUI Framework | PySide6 (Qt 6.11+) |
+| GUI | PySide6 (Qt 6.11+) |
 | Ngôn ngữ | Python 3.10+ |
 | Giao thức | MSP (MultiWii Serial Protocol) |
-| Kết nối | TCP Socket qua Wifi |
+| Kết nối | TCP Socket qua WiFi |
 | ESP32 Firmware | MicroPython |
 | Flight Controller | INAV firmware |
 
@@ -40,282 +41,363 @@
 
 ```
 DroneGCS/
-├── main.py                      ← Entry point + Điều phối Signal/Slot (class GCSApp + TakeoffDialog)
-├── AGENT.md                     ← File này
-├── memories.md                  ← Nhật ký phát triển (Development Log)
-├── _test_ui_refactor.py         ← Script test kiểm tra widget names
+├── main.py                    ← Entry point + Điều phối Signal/Slot (class GCSApp)
+├── AGENT.md                   ← File này — bối cảnh dự án cho AI
+├── memories.md                ← Nhật ký phát triển (Development Log)
 │
-├── comm/                        ← Package giao tiếp mạng
-│   ├── __init__.py
-│   ├── wifi_client.py           ← Socket TCP thô (connect/send/receive/close)
-│   ├── wifi_worker.py           ← QThread chạy ngầm (polling loop 20Hz, MSP_RAW_GPS)
-│   └── msp_parser.py            ← Đóng gói/giải mã MSP (ANALOG, ATTITUDE, ALTITUDE, STATUS, RAW_GPS, SET_WP)
+├── comm/
+│   ├── wifi_client.py         ← Socket TCP thô (connect/send/receive/close)
+│   ├── wifi_worker.py         ← QThread polling 20Hz: MSP polling + PING + ACK
+│   └── msp_parser.py          ← Đóng gói/giải mã MSP frames
 │
-├── core/                        ← Package logic nghiệp vụ
-│   ├── __init__.py
-│   ├── drone_state.py           ← Trạng thái drone chia sẻ (GPS, altitude, ARM, home position)
-│   └── flight_controller.py    ← State machine bay tự động (ARM, Takeoff, Safe Land, RTH, Mission)
+├── core/
+│   ├── drone_state.py         ← Trạng thái chia sẻ (GPS, altitude, ARM, ping)
+│   └── flight_controller.py  ← State machine (IDLE→ARM→TAKEOFF→HOLD→DISARM...)
 │
-├── ui/                          ← Package giao diện
-│   ├── __init__.py
-│   ├── main_window.py           ← Cửa sổ chính (Nav Rail + Stacked Pages) — Pure Python
-│   ├── dashboard_tab.py         ← Tab Dashboard (Attitude 3D + Telemetry + Motors)
-│   ├── manual_control_tab.py    ← Tab Manual Control (Sliders + ARM/DISARM/Takeoff)
-│   ├── mission_tab.py           ← Tab Mission (OpenStreetMap + Waypoints + Safety Logic)
-│   ├── emergency_overlay.py     ← Overlay cảnh báo khẩn cấp (DISARM + Safe Land)
-│   ├── attitude_3d_widget.py    ← Widget mô phỏng tư thế drone (Artificial Horizon)
-│   ├── config_tab.py            ← Tab Config (placeholder)
-│   ├── gcs_dashboard.py         ← ⚠️ LEGACY — KHÔNG DÙNG NỮA
-│   └── gcs_dashboard.ui         ← ⚠️ LEGACY — KHÔNG DÙNG NỮA
+├── ui/
+│   ├── main_window.py         ← Cửa sổ chính (Nav Rail + Top Bar + Pages)
+│   ├── dashboard_tab.py       ← Tab Dashboard (Attitude 3D + Telemetry + Motors)
+│   ├── manual_control_tab.py  ← Tab Manual Control (ARM/DISARM/Takeoff/RTH)
+│   ├── mission_tab.py         ← Tab Mission (OpenStreetMap + Waypoints)
+│   ├── emergency_overlay.py   ← Overlay khẩn cấp (DISARM + Safe Land)
+│   ├── attitude_3d_widget.py  ← Widget mô phỏng tư thế drone (Artificial Horizon)
+│   ├── config_tab.py          ← Tab Config (placeholder)
+│   ├── gcs_dashboard.py       ← ⚠️ LEGACY — KHÔNG DÙNG NỮA
+│   └── gcs_dashboard.ui       ← ⚠️ LEGACY — KHÔNG DÙNG NỮA
 │
-└── ESP32/
-    └── main.py                  ← Firmware MicroPython (cầu nối + failsafe chủ động RTH/SafeLand)
+├── ESP32/
+│   └── main.py                ← Firmware MicroPython (bridge + failsafe + PING/ACK)
+│
+└── tests/
+    ├── test_flight_logic.py   ← Unit tests cho FlightController + MSPParser
+    └── test_msp_noise_robustness.py ← 100 unit tests robustness MSP parser
 ```
 
 ---
 
-## 3. Kiến Trúc Module & Phân Chia Trách Nhiệm
+## 3. Kiến Trúc Module
 
-### 3.1 Sơ đồ kế thừa & quan hệ
+### 3.1 Phân cấp kế thừa UI
 
 ```
 QMainWindow
-    └── MainWindow (ui/main_window.py)     ← Chỉ xây layout UI
-            └── GCSApp (main.py)           ← Kế thừa, thêm logic Signal/Slot
+    └── MainWindow (ui/main_window.py)   ← Chỉ xây layout UI
+            └── GCSApp (main.py)         ← Kế thừa, thêm toàn bộ Signal/Slot logic
 ```
 
-### 3.2 Chi tiết từng module
-
-#### `main.py` — Entry Point & Điều Phối
-
-- **Class `ConnectionDialog`**: Dialog nhập IP/Port hoặc chọn Mock Test
-- **Class `GCSApp(MainWindow)`**: Kế thừa MainWindow, thêm toàn bộ logic
-  - `toggle_connection()`: Mở dialog kết nối hoặc ngắt kết nối
-  - `start_connection(ip, port, is_mock)`: Tạo WifiWorker + kết nối Signal/Slot
-  - `handle_connection_status(success, message)`: Slot xử lý trạng thái mạng
-  - `update_telemetry_ui(data: dict)`: Slot cập nhật dữ liệu telemetry lên UI
-  - `set_ui_state_na()`: Reset UI về trạng thái mất kết nối
-  - `enable_ui_components()`: Mở khóa UI khi có kết nối
-  - `closeEvent()`: Ngắt kết nối an toàn khi đóng app
-- **Hằng số**: `LIPO_6S_MIN_VOLTAGE = 19.8`, `LIPO_6S_MAX_VOLTAGE = 25.2`
-- **Quy trình khởi chạy**:
-  1. Tạo `GCSApp` → hiện cửa sổ
-  2. Tự động mở `ConnectionDialog`
-  3. Nếu Accept → gọi `start_connection()`
-
-#### `ui/main_window.py` — Layout Cửa Sổ Chính
-
-- **CHỈ chứa UI layout**, KHÔNG chứa logic xử lý
-- Cấu trúc:
-  ```
-  MainWindow (QMainWindow, 1200x800)
-  └── centralWidget (QVBoxLayout)
-      ├── frame_topbar (QFrame)
-      │   ├── lbl_batt_volt      (QLabel — "-- V")
-      │   ├── bar_battery_volt   (QProgressBar — 150-200px)
-      │   ├── lbl_batt_perc      (QLabel — "-- %")
-      │   ├── [spacer]
-      │   ├── lbl_wifi_status    (QLabel — "WiFi Status:")
-      │   ├── lbl_wifi_icon      (QLabel — "📶 Đang chờ")
-      │   └── btn_disconnect     (QPushButton — "Ngắt kết nối")
-      └── tab_widget (QTabWidget)
-          ├── dashboard_tab  → DashboardTab
-          ├── mission_tab    → MissionTab
-          ├── config_tab     → ConfigTab
-          └── tab_log        → QWidget (placeholder)
-  ```
-
-#### `ui/dashboard_tab.py` — Tab Giám Sát Chính
-
-- Layout dạng **Grid 2x2**:
-  - `[0,0]` — **Telemetry**: Pin, Mode, Armed, Altitude, GPS, Attitude, Speed
-  - `[0,1]` — **Manual Control**: 6 slider (Throttle, Roll, Pitch, Yaw, AUX1, AUX2) + 6 nút
-  - `[1,0..1]` — **Motors**: 4 thanh hiển thị vòng tua (PWM 1000-2000μs, dọc)
-
-#### `ui/mission_tab.py` — Tab Lập Trình Lộ Trình Bay
-
-- Form nhập Waypoint: Latitude, Longitude, Altitude
-- Bảng QTableWidget hiển thị danh sách waypoint (4 cột: #, Lat, Lon, Alt)
-- 5 nút: Remove, Clear, Upload To FC, Start Mission, Stop Mission
-
-#### `ui/config_tab.py` — Tab Cấu Hình (Placeholder)
-
-- Hiện tại chỉ hiển thị text placeholder
-- **Dự kiến**: PID Tuning, Rate Profiles, Motor Mapping, Sensor Calibration, Failsafe Config
-
-#### `comm/wifi_client.py` — Kết Nối TCP Thô
-
-- Class `WifiClient` — transport layer thuần túy
-- **4 phương thức**: `connect()`, `send(bytes)`, `receive() → bytes`, `close()`
-- Timeout đọc: `0.2s`, Buffer: `1024 bytes`
-- Property `is_connected` kiểm tra trạng thái
-
-#### `comm/wifi_worker.py` — Luồng Ngầm QThread
-
-- Class `WifiWorker(QThread)`
-- **2 Signal**:
-  - `connection_status(bool, str)` → GCSApp.handle_connection_status
-  - `telemetry_data(dict)` → GCSApp.update_telemetry_ui
-- **2 chế độ chạy**:
-  - `_run_real_mode()`: Kết nối ESP32 thật, polling MSP_ANALOG + MSP_ATTITUDE luân phiên
-  - `_run_mock_mode()`: Giả lập dữ liệu telemetry (pin tụt dần, góc nghiêng dao động, motor ngẫu nhiên)
-- Tần số polling: **20Hz** (`POLLING_INTERVAL = 0.05s`)
-- `stop()`: Dừng thread an toàn bằng cờ `is_running = False`
-
-#### `comm/msp_parser.py` — Giao Thức MSP
-
-- Class `MSPParser`
-- **Lệnh hỗ trợ**:
-  - `MSP_WP_GETINFO (20)`: Thông tin mission (số waypoint)
-  - `MSP_SONAR_ALTITUDE (58)`: Độ cao bề mặt từ LiDAR MTF-02 (rangefinder)
-  - `MSP_STATUS (101)`: Trạng thái ARM + flight mode flags
-  - `MSP_RAW_GPS (106)`: Tọa độ GPS, số vệ tinh, tốc độ (từ GPS BZ 251)
-  - `MSP_ATTITUDE (108)`: Góc nghiêng Roll, Pitch, Yaw
-  - `MSP_ALTITUDE (109)`: Độ cao barometer + vario
-  - `MSP_ANALOG (110)`: Điện áp pin, dòng điện
-- **Đóng gói**: `pack_msg(cmd, payload) → bytes` : Frame = `$M<` + Size + Cmd + Payload + Checksum
-- **Giải mã**: `parse_buffer(data) → dict` : Gom buffer chống đứt gói, tìm `$M>`, verify checksum XOR
-- **Buffer Protection**: MAX_BUFFER_SIZE = 4096 bytes, tự cắt khi vượt quá
-- **Struct format**:
-  - MSP_ANALOG: `'<B H H h'` (7 bytes: vbat, mah_drawn, rssi, amperage)
-  - MSP_ATTITUDE: `'<h h h'` (6 bytes: roll, pitch, yaw)
-  - MSP_SONAR_ALTITUDE: `'<i'` (4 bytes: surface_alt_cm, âm = ngoài tầm)
-
-#### `ESP32/main.py` — Firmware MicroPython
-
-- Wifi AP: SSID `Drone_GCS_Wifi`, password `DroneGCS@2026!`
-- UART1: baudrate=115200, TX=17, RX=16 (Buffer=512)
-- TCP Server: port 8080, non-blocking. Single client.
-- 4 luồng xử lý trong vòng lặp chính:
-  1. **Quản lý kết nối**: Accept client mới. Đóng kết nối nếu send() lỗi liên tiếp 10 lần.
-  2. **PC → FC**: Đọc TCP, xử lý prefix (`FS:`, `EM:`, `HB:`). Nếu là `EM:`, xoá UART buffer và flush lệnh khẩn cấp. Mặc định: chuyển trực tiếp rbytes.
-  3. **FC → PC**: read UART (max 256 bytes) → send TCP
-  4. **Failsafe Watchdog**: Mất tín hiệu > 2000ms → gửi RTH liên tục (10Hz). **KHÔNG đóng socket** trong vòng lặp failsafe.
-
----
-
-## 4. Luồng Dữ Liệu Chi Tiết
-
-### 4.1 Telemetry (FC → UI)
+### 3.2 Sơ đồ luồng dữ liệu
 
 ```
-[Flight Controller]
-        │ UART (MSP Response: $M> + payload)
-        ▼
-[ESP32] ──── TCP ────→ [WifiClient.receive()]
-                              │ raw bytes
-                              ▼
-                        [MSPParser.parse_buffer()]
-                              │ dict: {"voltage": 24.5, "roll": 1.2, ...}
-                              ▼
-                        [WifiWorker] ──Signal──→ [GCSApp.update_telemetry_ui()]
-                                                        │
-                                                        ▼
-                                                 [Cập nhật QLabel/QProgressBar]
-```
-
-### 4.2 Lệnh điều khiển (UI → FC)  *(chưa implement đầy đủ)*
-
-```
-[UI Button/Slider]
-        │ Slide change / click
-        ▼
-[GCSApp] → [WifiWorker] → [MSPParser.pack_msg()] → [WifiClient.send()] → TCP → [ESP32] → UART → [FC]
-```
-
-### 4.3 Mock Mode
-
-```
-[WifiWorker._run_mock_mode()]
-        │ random.uniform() + giảm điện áp dần
-        │ dict: {"voltage", "pitch", "roll", "yaw", "motor1-4"}
-        │
-        ▼ Signal: telemetry_data
-[GCSApp.update_telemetry_ui()] → Cập nhật UI y hệt chế độ thật
+┌─────────────────────────────────────────────────────────────┐
+│                         GCS (PC)                             │
+│                                                               │
+│  FlightController ──send_command()──→ WifiWorker             │
+│       ↑ state_changed                     │ TCP              │
+│       │ status_update              ┌──────▼──────┐           │
+│  GCSApp (main.py)                 │   ESP32 AP   │           │
+│       ↑ telemetry_data            └──────┬──────┘           │
+│       │ ping_updated                     │ UART              │
+│       │ command_acked             ┌──────▼──────┐           │
+│  UI Widgets                      │ FC (INAV)    │           │
+│                                  └─────────────┘           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 5. Dict Telemetry Data — Bảng Key/Value
+## 4. Chi Tiết Từng Module
 
-Đây là format dict được truyền qua Signal `telemetry_data` và xử lý trong `update_telemetry_ui()`:
+### 4.1 `main.py` — Entry Point & Điều Phối
 
-| Key | Type | Unit | Nguồn MSP | Cách tính từ raw |
-|---|---|---|---|---|
-| `voltage` | float | Volt | MSP_ANALOG | `vbat / 10.0` |
-| `current` | float | Ampere | MSP_ANALOG | `amperage / 100.0` |
-| `roll` | float | Degree (°) | MSP_ATTITUDE | `raw_roll / 10.0` |
-| `pitch` | float | Degree (°) | MSP_ATTITUDE | `raw_pitch / 10.0` |
-| `yaw` | float/int | Degree (0-360°) | MSP_ATTITUDE | Giá trị trực tiếp |
-| `motor1` | int | PWM μs (1000-2000) | *(chưa implement)* | — |
-| `motor2` | int | PWM μs (1000-2000) | *(chưa implement)* | — |
-| `motor3` | int | PWM μs (1000-2000) | *(chưa implement)* | — |
-| `motor4` | int | PWM μs (1000-2000) | *(chưa implement)* | — |
-| `surface_altitude` | float | Mét | MSP_SONAR_ALTITUDE | `surface_alt_cm / 100.0`, -1.0 nếu OOR |
-| `surface_quality` | int | 0-255 | MSP_SONAR_ALTITUDE | 255 nếu hợp lệ, 0 nếu OOR |
+**Classes:**
+- `ConnectionDialog`: Dialog nhập IP/Port hoặc chọn Mock Test
+- `TakeoffDialog`: Dialog nhập độ cao và hiển thị GPS status trước khi cất cánh
+- `GCSApp(MainWindow)`: Kế thừa MainWindow, thêm toàn bộ Signal/Slot logic
+
+**Signals connections trong `start_connection()`:**
+```python
+self.worker.connection_status.connect(self.handle_connection_status)
+self.worker.telemetry_data.connect(self.update_telemetry_ui)
+self.worker.ping_updated.connect(self._on_ping_updated)      # MỚI 2026-04-13
+self.worker.command_acked.connect(self._on_command_acked)    # MỚI 2026-04-13
+```
+
+**Slots quan trọng:**
+- `_on_ping_updated(rtt_ms)`: Cập nhật `lbl_ping` với màu sắc (xanh/vàng/cam/đỏ)
+- `_on_command_acked(ack_type)`: Hiển thị "✓ Failsafe config" / "✓ Emergency cmd" trên status
+- `_emergency_force_disarm()`: Gọi `force_disarm()` trên FlightController
+- `update_telemetry_ui(data)`: Cập nhật toàn bộ UI từ dict telemetry
+
+**Hằng số:**
+- `LIPO_6S_MIN_VOLTAGE = 19.8V`, `LIPO_6S_MAX_VOLTAGE = 25.2V`
 
 ---
 
-## 6. Naming Convention — Quy Tắc Đặt Tên Widget
+### 4.2 `ui/main_window.py` — Layout Cửa Sổ Chính
 
-### Prefix
+**Widget `frame_topbar` (từ trái → phải):**
+```
+[lbl_batt_volt] [bar_battery_volt] [lbl_batt_perc] [spacer]
+[lbl_ping_title] [lbl_ping]  [spacer]
+[lbl_wifi_status] [lbl_wifi_icon] [spacer]
+[btn_disconnect]
+```
 
-| Prefix | Loại widget | Ví dụ |
-|---|---|---|
-| `lbl_` | QLabel (mô tả) | `lbl_batt_volt`, `lbl_roll` |
-| `val_` | QLabel (giá trị hiển thị, **font bold**) | `val_roll`, `val_motor1` |
-| `bar_` | QProgressBar | `bar_battery_volt`, `bar_motor1` |
-| `btn_` | QPushButton | `btn_disconnect`, `btn_arm` |
-| `slider_` | QSlider | `slider_throttle`, `slider_roll` |
-| `input_` | QLineEdit | `input_ip`, `input_lat` |
-| `grp_` | QGroupBox | `grp_telemetry`, `grp_motors` |
-| `tab_` | QWidget (tab page) | `tab_log` |
-| `table_` | QTableWidget | `table_waypoints` |
+> **`lbl_ping`** (MỚI 2026-04-13): Hiển thị "🏓 28ms" với màu:
+> - `#4CAF50` xanh ≤50ms · `#FFC107` vàng ≤150ms · `#FF9800` cam ≤300ms · `#F44336` đỏ >300ms
 
-### Widget thuộc về đâu?
+**Nav Rail** (bên trái, QListWidget): Dashboard / Manual Control / Mission / Config / Log
 
-| Widget | Thuộc class | Truy cập từ GCSApp |
+**Widget ownership:**
+
+| Widget | Class | Truy cập từ GCSApp |
 |---|---|---|
 | `lbl_batt_volt`, `bar_battery_volt`, `lbl_batt_perc` | MainWindow | `self.lbl_batt_volt` |
+| `lbl_ping`, `lbl_ping_title` | MainWindow | `self.lbl_ping` |
 | `lbl_wifi_icon`, `btn_disconnect` | MainWindow | `self.lbl_wifi_icon` |
 | `val_roll`, `val_pitch`, `val_yaw` | DashboardTab | `self.dashboard_tab.val_roll` |
 | `val_motor1`, `bar_motor1` | DashboardTab | `self.dashboard_tab.val_motor1` |
-| `grp_manual_control` | DashboardTab | `self.dashboard_tab.grp_manual_control` |
+| `val_flight_status` | ManualControlTab | `self.manual_control_tab.val_flight_status` |
 | `table_waypoints`, `btn_upload` | MissionTab | `self.mission_tab.table_waypoints` |
 
 ---
 
-## 7. Thông Số Phần Cứng
+### 4.3 `comm/wifi_worker.py` — QThread Polling
 
-### Pin Lipo 6S
+**Signals:**
+```python
+connection_status = Signal(bool, str)   # (success, message)
+telemetry_data    = Signal(dict)        # dữ liệu đã decode
+ping_updated      = Signal(int)         # RTT ms (MỚI 2026-04-13)
+command_acked     = Signal(str)         # "RC" | "FS" | "EM" (MỚI 2026-04-13)
+```
 
-| Thông số | Giá trị |
+**Command Queues:**
+- `_command_queue`: Queue thường (telemetry poll order, RC frames...)
+- `_emergency_queue`: Queue ưu tiên cao nhất (force_disarm, force_safe_land)
+
+**`send_emergency_command(data)`**:
+1. Set cờ `_emergency_abort`
+2. Xóa toàn bộ `_command_queue`
+3. Đưa vào `_emergency_queue`
+
+**Tách luồng text/binary trong `_extract_text_responses()`:**
+- `PONG:<ts>\n` → tính RTT → `ping_updated.emit(rtt)`
+- `ACK:<type>\n` → `command_acked.emit(type)`
+- Bytes còn lại (MSP `$M>...`) → MSP parser
+
+**MSP polling 20Hz** (luân phiên):
+```
+ANALOG → ATTITUDE → ALTITUDE → STATUS → RAW_GPS → SONAR_ALTITUDE → STATUS_EX
+```
+
+**PING gửi mỗi 1 giây** (trong vòng lặp real mode):
+```python
+ping_msg = f"PING:{int(now*1000)}".encode()
+```
+
+---
+
+### 4.4 `comm/msp_parser.py` — Giao Thức MSP
+
+**Lệnh hỗ trợ:**
+
+| Constant | ID | Mô tả |
+|---|---|---|
+| `MSP_WP_GETINFO` | 20 | Thông tin mission |
+| `MSP_SONAR_ALTITUDE` | 58 | Độ cao LiDAR MTF-02 (cm, âm = OOR) |
+| `MSP_STATUS` | 101 | ARM status + flight mode flags |
+| `MSP_RAW_GPS` | 106 | GPS BZ 251: lat, lon, sats, speed, fix |
+| `MSP_ATTITUDE` | 108 | Roll, Pitch, Yaw |
+| `MSP_ALTITUDE` | 109 | Barometer + vario |
+| `MSP_ANALOG` | 110 | Voltage, current |
+| `MSP_STATUS_EX` | 150 | Sensor health (OptFlow, LiDAR, Compass) |
+| `MSP_SET_RAW_RC` | 200 | Gửi 8 kênh RC xuống FC |
+| `MSP_SET_WP` | 209 | Upload waypoint |
+
+**Buffer Protection**: `MAX_BUFFER_SIZE = 4096 bytes`
+
+---
+
+### 4.5 `core/drone_state.py` — Trạng Thái Chia Sẻ
+
+Các field quan trọng:
+
+```python
+# ARM
+is_armed: bool
+
+# Altitude
+altitude: float          # Barometer (mét)
+surface_altitude: float  # LiDAR MTF-02 (mét, -1.0 nếu OOR)
+surface_quality: int     # 0-255
+
+# GPS
+latitude, longitude: float
+gps_fix_type: int        # 0=No Fix, 1=2D, 2=3D
+gps_num_sat: int
+
+# Attitude
+roll, pitch, yaw: float
+
+# Home position
+home_lat, home_lon: float
+has_home: bool
+
+# Sensor health
+sensor_opflow: bool
+sensor_rangefinder: bool
+sensor_mag: bool
+
+# Network quality (MỚI 2026-04-13)
+ping_rtt_ms: int         # RTT GCS↔ESP32 (ms)
+```
+
+---
+
+### 4.6 `core/flight_controller.py` — State Machine Bay
+
+**States:**
+
+```
+IDLE
+├── arm()         → WAIT_RC_LINK_ARM_ONLY → ARMING_ONLY → IDLE
+├── takeoff()     → PRE_ARM_CHECK → WAIT_RC_LINK → ARMING → ARMED_WAIT
+│                   → WP_UPLOAD → WP_ACTIVATE → NAV_CLIMB → ALTITUDE_REACHED → HOLDING
+├── safe_land()   → SAFE_LANDING → IDLE (khi FC disarm)
+├── rth()         → RTH_ACTIVE → IDLE (khi FC disarm)
+├── disarm()      → DISARMING → IDLE (khi is_armed=False)       [MỚI 2026-04-13]
+└── force_disarm()→ FORCE_DISARMING → IDLE (khi is_armed=False) [MỚI 2026-04-13]
+```
+
+**AUX Channel Mapping (chuẩn AETR, index trong MSP frame):**
+
+```
+Index: [0=Roll, 1=Pitch, 2=Throttle, 3=Yaw, 4=AUX1, 5=AUX2, 6=AUX3, 7=AUX4]
+
+AUX1 (CH5): ARM/DISARM    — 1000=DISARM, 2000=ARM
+AUX2 (CH6): Flight Mode   — 1000=Acro, 1500=ANGLE, 2000=ALTHOLD+POSHOLD
+AUX3 (CH7): Safe Land     — 1000=OFF, 2000=ON
+AUX4 (CH8): RTH           — 1000=OFF, 2000=ON
+```
+
+**`_safe_channels()` — bộ kênh mặc định an toàn:**
+```python
+[RC_CENTER, RC_CENTER, THROTTLE_MIN, RC_CENTER,
+ AUX_DISARM, AUX_ANGLE, AUX_SAFE_LAND_OFF, AUX_RTH_OFF]
+ # [Roll,    Pitch,     Throttle,    Yaw,
+ #  AUX1=DISARM, AUX2=ANGLE, AUX3=OFF, AUX4=OFF]
+```
+
+**Hằng số quan trọng:**
+- `TICK_INTERVAL_MS = 100` (10Hz)
+- `RC_LINK_WAIT_S = 2.0` — INAV cần thấy DISARM ≥1s trước khi cho phép ARM
+- `ARM_TIMEOUT_S = 5.0`
+- `DISARM_TIMEOUT_S = 5.0` — timeout chờ FC xác nhận DISARM
+- `LIDAR_MAX_RANGE_M = 2.5`
+
+---
+
+### 4.7 `ESP32/main.py` — Firmware MicroPython
+
+**Cấu hình:**
+- WiFi AP: SSID `Drone_GCS_Wifi`, password `DroneGCS@2026!`, IP `192.168.4.1`
+- TCP Server: port 8080, non-blocking
+- UART1: baudrate=115200, TX=GPIO17, RX=GPIO16, rxbuf=512
+
+**Prefix lệnh đặc biệt (từ GCS → ESP32):**
+
+| Prefix | Xử lý |
 |---|---|
-| Số cell | 6S |
-| Điện áp rỗng | 19.8V (3.3V/cell) |
-| Điện áp đầy | 25.2V (4.2V/cell) |
-| Công thức % | `(V - 19.8) / (25.2 - 19.8) * 100` |
-| FC gửi raw | `vbat * 10` (VD: 245 = 24.5V) |
+| `EM:<msp_frame>` | Emergency: xóa UART buffer → gửi ngay → tắt failsafe → reply `ACK:EM\n` |
+| `FS:rth` / `FS:ignore` | Cấu hình failsafe behavior → reply `ACK:FS\n` |
+| `PING:<timestamp_ms>` | Đo latency → reply `PONG:<timestamp_ms>\n` |
+| `HB:` | Heartbeat (reset failsafe timer, không gửi xuống FC) |
+| `$M<...` (MSP frame) | Chuyển tiếp xuống FC qua UART. Nếu là MSP_SET_RAW_RC → reply `ACK:RC\n` |
 
-### Động cơ
+**Failsafe watchdog:**
+- Timeout: `2000ms` không nhận gì từ PC → kích hoạt
+- Behavior `rth`: gửi RTH frame 10Hz qua UART liên tục
+- Behavior `ignore`: không can thiệp (FC bay hết mission)
+- **QUAN TRỌNG: KHÔNG đóng socket khi failsafe** — giữ mở để GCS override
 
-| Thông số | Giá trị |
-|---|---|
-| KV | 1960kv |
-| PWM Range | 1000μs (idle) → 2000μs (full throttle) |
-| Số lượng | 4 (quadcopter) |
+---
 
-### ESP32
+## 5. Giao Thức PING/ACK (MỚI 2026-04-13)
 
-| Thông số | Giá trị |
-|---|---|
-| Wifi Mode | Access Point |
-| SSID | `Drone_GCS_Wifi` |
-| Password | `DroneGCS@2026!` |
-| IP | `192.168.4.1` |
-| TCP Port | `8080` |
-| UART | Baudrate 115200, TX=GPIO17, RX=GPIO16 |
-| Failsafe timeout | 2000ms |
+### Đo latency GCS ↔ ESP32
+
+```
+GCS gửi: "PING:1713011234567\n"   (timestamp ms)
+ESP32 phản hồi: "PONG:1713011234567\n"
+GCS tính: RTT = time.now_ms - 1713011234567
+```
+
+### ACK confirmation
+
+```
+ESP32 → GCS:
+  ACK:EM\n   — Emergency command đã xử lý
+  ACK:FS\n   — Failsafe config đã lưu
+  ACK:RC\n   — MSP_SET_RAW_RC đã chuyển tiếp xuống FC
+```
+
+### WifiWorker stream parsing
+
+PONG/ACK là text kết thúc bằng `\n`, MSP response là binary bắt đầu bằng `$M>`.
+`_extract_text_responses()` tách 2 loại trên cùng TCP stream bằng cách:
+1. Quét từng byte tìm prefix `PONG:` hoặc `ACK:`
+2. Tìm `\n` kết thúc → xử lý
+3. Bytes còn lại → trả về cho MSP parser
+
+---
+
+## 6. FIX: DISARM Delay 10-20s (2026-04-13)
+
+### Root cause
+`disarm()` và `force_disarm()` cũ là **fire-and-forget**: gửi 1-3 frame rồi `timer.stop()`.
+Khi INAV đang ở NAV modes (takeoff, mission), FC **từ chối DISARM** cho đến khi
+thoát NAV mode tự nhiên → đợi 10-20s.
+
+### Fix: Repeated-send State Machine
+
+**`disarm()` mới:**
+- Gửi frame đầu tiên ngay
+- Chuyển state → `DISARMING`
+- Timer 10Hz tiếp tục gửi DISARM qua **normal queue**
+- Kết thúc khi: `is_armed == False` **hoặc** timeout 5s
+
+**`force_disarm()` mới:**
+1. Frame 1: Tắt NAV modes (AUX2=ANGLE, AUX1=ARM-giữ) qua **emergency queue**
+2. Frame 2-3: DISARM (AUX1=1000) qua **emergency queue**
+3. Chuyển state → `FORCE_DISARMING`
+4. Timer 10Hz tiếp tục gửi DISARM qua **emergency queue**
+5. Kết thúc khi: `is_armed == False` **hoặc** timeout 5s
+
+---
+
+## 7. Luồng Dữ Liệu Telemetry (dict keys)
+
+| Key | Type | Unit | MSP nguồn |
+|---|---|---|---|
+| `voltage` | float | V | MSP_ANALOG (`vbat/10`) |
+| `current` | float | A | MSP_ANALOG (`amperage/100`) |
+| `roll` | float | ° | MSP_ATTITUDE (`raw/10`) |
+| `pitch` | float | ° | MSP_ATTITUDE (`raw/10`) |
+| `yaw` | float/int | ° (0-360) | MSP_ATTITUDE |
+| `altitude` | float | m | MSP_ALTITUDE |
+| `vario` | float | m/s | MSP_ALTITUDE |
+| `is_armed` | bool | — | MSP_STATUS |
+| `flight_mode_flags` | int | bitmask | MSP_STATUS |
+| `gps_fix_type` | int | 0/1/2 | MSP_RAW_GPS |
+| `gps_num_sat` | int | — | MSP_RAW_GPS |
+| `latitude`, `longitude` | float | ° | MSP_RAW_GPS |
+| `ground_speed` | float | m/s | MSP_RAW_GPS |
+| `surface_altitude` | float | m | MSP_SONAR_ALTITUDE (-1 = OOR) |
+| `surface_quality` | int | 0-255 | MSP_SONAR_ALTITUDE |
+| `sensor_opflow` | bool | — | MSP_STATUS_EX |
+| `sensor_rangefinder` | bool | — | MSP_STATUS_EX |
+| `sensor_mag` | bool | — | MSP_STATUS_EX |
 
 ---
 
@@ -323,151 +405,175 @@ QMainWindow
 
 ### 8.1 Phân tách trách nhiệm (SoC)
 
-| Module | CHỈ ĐƯỢC LÀM | KHÔNG ĐƯỢC LÀM |
-|---|---|---|
-| `main.py` | Khởi tạo, kết nối Signal/Slot, cập nhật UI | Gọi socket trực tiếp, giải mã MSP |
-| `wifi_client.py` | Mở/đóng socket, gửi/nhận bytes | Import QThread, biết về MSP |
-| `wifi_worker.py` | Chạy vòng lặp ngầm, dùng WifiClient + MSPParser | Cập nhật UI trực tiếp |
-| `msp_parser.py` | Đóng gói/giải mã MSP | Import socket, biết về thread |
-| `ui/main_window.py` | Xây dựng layout UI | Chứa logic nghiệp vụ |
-| `ui/dashboard_tab.py` | Xây dựng nhóm widget | Kết nối Signal/Slot nghiệp vụ |
-| `ui/mission_tab.py` | Xây dựng form waypoint | Xử lý upload FC |
+| Module | CHỈ ĐƯỢC LÀM |
+|---|---|
+| `main.py` | Khởi tạo, kết nối Signal/Slot, cập nhật UI |
+| `wifi_client.py` | Mở/đóng socket, gửi/nhận bytes |
+| `wifi_worker.py` | Vòng lặp ngầm, dùng WifiClient + MSPParser |
+| `msp_parser.py` | Đóng gói/giải mã MSP |
+| `ui/main_window.py` | Xây dựng layout UI (KHÔNG chứa logic) |
+| `flight_controller.py` | State machine, gửi lệnh qua WifiWorker |
 
 ### 8.2 Quy tắc UI
 
-1. **`ui/*.py` CHỈ tạo widget** — Không chứa Signal/Slot logic
-2. **GCSApp kết nối Signal/Slot** — Tất cả logic nằm ở `main.py`
-3. **Widget Top Bar** (pin, wifi, btn_disconnect) thuộc `MainWindow` — truy cập trực tiếp qua `self`
-4. **Widget trong Tab** thuộc từng class riêng — truy cập qua `self.dashboard_tab`, `self.mission_tab`
-5. **Thêm widget mới** phải đặt tên theo prefix convention (mục 6)
+1. `ui/*.py` **CHỈ tạo widget** — KHÔNG chứa Signal/Slot logic nghiệp vụ
+2. **GCSApp** kết nối Signal/Slot — tất cả logic nằm ở `main.py`
+3. **Widget Top Bar** thuộc `MainWindow` — truy cập qua `self`
+4. **Widget trong Tab** thuộc class riêng — truy cập qua `self.dashboard_tab` v.v.
+5. **Thêm widget** phải đặt tên theo prefix convention (mục 9)
 
 ### 8.3 Quy tắc Comm
 
-1. **WifiWorker phát Signal**, không bao giờ gọi `widget.setText()` trực tiếp
-2. **MSPParser là stateless** (ngoại trừ buffer) — không biết đang kết nối ở đâu
-3. **Thêm lệnh MSP mới**: thêm constant + thêm case trong `_decode_payload()` + thêm cmd vào `cmds_to_request` trong WifiWorker
+1. `WifiWorker` phát **Signal**, không bao giờ gọi `widget.setText()` trực tiếp
+2. **Thêm lệnh MSP mới**:
+   - `msp_parser.py`: Thêm constant + case trong `_decode_payload()`
+   - `wifi_worker.py`: Thêm vào `cmds_to_request`
+   - `main.py`: Xử lý key mới trong `update_telemetry_ui()`
 
-### 8.4 File Legacy — KHÔNG CHẠM VÀO
+### 8.4 Thread Safety
 
-- `ui/gcs_dashboard.py` — Auto-generated từ Qt Designer, **KHÔNG DÙNG NỮA**
-- `ui/gcs_dashboard.ui` — File .ui gốc, giữ để tham khảo
+- `FlightController` chạy trên **Main Thread** (QTimer)
+- `WifiWorker` chạy trên **Worker Thread** (QThread)
+- Chỉ giao tiếp qua: `send_command()`, `send_emergency_command()` (Queue), Signals
+- **KHÔNG truy cập `_client` hoặc `_parser` từ bên ngoài WifiWorker**
 
 ---
 
-## 9. Trạng Thái Tính Năng
+## 9. Naming Convention Widgets
+
+| Prefix | Loại | Ví dụ |
+|---|---|---|
+| `lbl_` | QLabel (mô tả) | `lbl_batt_volt`, `lbl_ping` |
+| `val_` | QLabel (giá trị, bold) | `val_roll`, `val_motor1` |
+| `bar_` | QProgressBar | `bar_battery_volt`, `bar_motor1` |
+| `btn_` | QPushButton | `btn_disconnect`, `btn_arm` |
+| `slider_` | QSlider | `slider_throttle` |
+| `input_` | QLineEdit | `input_ip`, `input_lat` |
+| `grp_` | QGroupBox | `grp_telemetry` |
+| `tab_` | QWidget (tab page) | `tab_log` |
+| `table_` | QTableWidget | `table_waypoints` |
+
+---
+
+## 10. Thông Số Phần Cứng
+
+### Pin Lipo 6S
+- Rỗng: 19.8V (3.3V/cell), Đầy: 25.2V (4.2V/cell)
+- Công thức %: `(V - 19.8) / (25.2 - 19.8) * 100`
+- FC gửi raw: `vbat * 10` (VD: 245 = 24.5V)
+
+### Động cơ & FC
+- KV: 1960kv, PWM: 1000-2000μs, Số lượng: 4
+- FC: SpeedyBee F405 AIO, Khung: OddityRC XI35 Pro O4 3.5" Cinewhoop
+
+### ESP32
+| | |
+|---|---|
+| WiFi Mode | Access Point |
+| SSID | `Drone_GCS_Wifi` |
+| Password | `DroneGCS@2026!` |
+| IP | `192.168.4.1` |
+| TCP Port | `8080` |
+| UART | baudrate=115200, TX=GPIO17, RX=GPIO16 |
+| Failsafe timeout | 2000ms |
+
+### INAV CLI cần thiết
+```
+nav_use_midthr_for_althold = 1   (50% throttle = hover)
+nav_mc_hover_thr = 1500
+nav_mc_auto_climb_rate = 300     (climb rate tối đa cm/s)
+nav_surface_control = AUTO       (INAV tự dùng LiDAR MTF-02)
+```
+
+---
+
+## 11. Trạng Thái Tính Năng
 
 ### ✅ Đã hoàn thành
 
 - [x] Kiến trúc module sạch (tách UI / Comm / Logic)
-- [x] Kết nối TCP Wifi tới ESP32
-- [x] Giải mã MSP_ANALOG (Voltage, Current)
-- [x] Giải mã MSP_ATTITUDE (Roll, Pitch, Yaw)
-- [x] Giải mã MSP_ALTITUDE (Altitude, Vario)
-- [x] Giải mã MSP_STATUS (ARM status, flight mode flags)
-- [x] Giải mã MSP_RAW_GPS (GPS BZ 251: lat, lon, sats, speed, fix)
-- [x] Hiển thị Telemetry trên Dashboard (pin, góc, GPS, altitude)
-- [x] Hiển thị PWM 4 Motor (thanh dọc)
-- [x] Mock Test mode (giả lập dữ liệu + GPS)
-- [x] Connection Dialog (nhập IP/Port hoặc Mock)
-- [x] Quản lý trạng thái kết nối/mất kết nối trên UI
-- [x] ESP32 firmware failsafe chủ động (RTH/SafeLand khi mất WiFi)
-- [x] ARM / DISARM (state machine + RC link safety)
-- [x] Takeoff & Hold (dialog nhập độ cao + ALTHOLD+POSHOLD)
-- [x] Safe Land (AUX3=2000 → FC hạ cánh tại chỗ)
-- [x] RTH — Return To Home (AUX4=2000 → FC bay về home)
-- [x] Emergency Overlay (nút DISARM + Safe Land nổi trên UI)
-- [x] Tab Mission — OpenStreetMap + Waypoints tương tác + Logic an toàn
-- [x] MSP_SET_WP — Upload waypoints xuống FC
-- [x] Cấu hình failsafe từ PC xuống ESP32 (FS:rth / FS:ignore)
-- [x] DroneState — Centralized state management (GPS + Home position)
-- [x] Dark theme + animations + responsive layout
-- [x] Test script kiểm tra widget names (`_test_ui_refactor.py`)
+- [x] Kết nối TCP WiFi tới ESP32
+- [x] Giải mã đầy đủ: MSP_ANALOG, ATTITUDE, ALTITUDE, STATUS, RAW_GPS, SONAR_ALTITUDE, STATUS_EX
+- [x] Dashboard: Pin, góc nghiêng, GPS, altitude, motor bars, LiDAR quality
+- [x] Attitude 3D Widget (Artificial Horizon)
+- [x] Mock Test mode (giả lập toàn bộ dữ liệu + GPS + LiDAR)
+- [x] Connection Dialog (IP/Port hoặc Mock)
+- [x] ESP32 failsafe chủ động (RTH/SafeLand khi mất WiFi, giữ socket mở)
+- [x] Emergency Protocol (prefix `EM:` bypass queue)
+- [x] ARM / DISARM (state machine + INAV ARM_SWITCH safety)
+- [x] **DISARM repeated-send** (không còn delay 10-20s) ← MỚI 2026-04-13
+- [x] **FORCE DISARM emergency repeated-send** ← MỚI 2026-04-13
+- [x] Takeoff & Hold (ALTHOLD+POSHOLD, NAV WP hoặc ALTHOLD fallback)
+- [x] Safe Land (AUX3=2000, FC tự hạ)
+- [x] RTH (AUX4=2000, FC bay về Home)
+- [x] Emergency Overlay (nút DISARM + Safe Land nổi)
+- [x] Tab Mission: OpenStreetMap + Waypoints + Upload MSP_SET_WP
+- [x] Failsafe config từ PC (FS:rth / FS:ignore)
+- [x] MTF-02 LiDAR: MSP_SONAR_ALTITUDE + Dashboard display
+- [x] Sensor health: OptFlow, LiDAR, Compass (MSP_STATUS_EX)
+- [x] **PING/PONG latency measurement** ← MỚI 2026-04-13
+- [x] **ACK confirmation (EM/FS/RC)** ← MỚI 2026-04-13
+- [x] **Ping label trên Top Bar** (màu sắc theo chất lượng) ← MỚI 2026-04-13
+- [x] Unit tests (116 passed, 3 xfailed)
 
-### 🚧 Đang phát triển / Chưa implement
+### 🚧 Chưa implement
 
-- [ ] **Gửi lệnh Manual Control** (slider → MSP_SET_RAW_RC → FC)
-- [ ] **Tab Config**: PID Tuning, Rate Profiles, Motor Mapping
-- [ ] **Tab Log**: Ghi log telemetry lịch sử
-- [ ] **Motor data từ FC** (hiện chỉ có trong Mock, chưa parse MSP_MOTOR)
-
-### ✅ Đã hoàn thành (Cập nhật 2026-04-09)
-
-- [x] **MTF-02 LiDAR Integration**: MSP_SONAR_ALTITUDE polling + decode
-- [x] **Sensor Fusion**: Tự động chọn LiDAR (<2.5m) hoặc Baro
-- [x] **LiDAR-Assisted Takeoff**: Hiển thị nguồn độ cao (LiDAR/Baro) khi cất cánh
-- [x] **Soft Landing**: Giảm tốc khi LiDAR < 1m, phát hiện chạm đất < 0.15m
-- [x] **Dashboard LiDAR Display**: Surface Alt + LiDAR Quality trên Telemetry
-- [x] **Mock LiDAR**: Giả lập surface_altitude khi altitude ≤ 2.5m
-- [x] **QA Fixes**: Buffer overflow protection, thread safety, ESP32 gc.collect()
+- [ ] Manual Control sliders → MSP_SET_RAW_RC → FC
+- [ ] Tab Config: PID Tuning, Rate Profiles, Motor Mapping
+- [ ] Tab Log: ghi log telemetry lịch sử
+- [ ] MSP_MOTOR — Motor PWM thật từ FC (hiện chỉ có trong Mock)
 
 ---
 
-## 10. Hướng Dẫn Thêm Tính Năng Mới
+## 12. Thêm Tính Năng Mới
 
-### Thêm lệnh MSP mới (VD: MSP_RAW_GPS = 106)
+### Thêm lệnh MSP mới
 
-1. **`msp_parser.py`**: Thêm constant `MSP_RAW_GPS = 106` + thêm `elif` trong `_decode_payload()`
-2. **`wifi_worker.py`**: Import constant mới, thêm vào list `cmds_to_request`
-3. **`main.py`**: Xử lý key mới trong `update_telemetry_ui(data)`
-4. **`dashboard_tab.py`**: Thêm widget (nếu cần hiển thị)
+1. `msp_parser.py`: `MSP_XXX = <id>` + `elif cmd == MSP_XXX:` trong `_decode_payload()`
+2. `wifi_worker.py`: Thêm `MSP_XXX` vào `cmds_to_request`
+3. `main.py`: Xử lý key mới trong `update_telemetry_ui(data)`
+4. `dashboard_tab.py` (nếu cần hiển thị): Thêm widget
 
 ### Thêm Tab mới
 
-1. Tạo file `ui/new_tab.py` với class kế thừa `QWidget`
-2. Import trong `ui/main_window.py`, thêm vào `_create_tabs()`
-3. Xử lý logic Signal/Slot trong `main.py` (class GCSApp)
-
-### Thêm nút điều khiển
-
-1. Thêm widget trong `dashboard_tab.py` hoặc tab tương ứng
-2. Kết nối `btn.clicked.connect(handler)` trong `main.py`
-3. Trong handler: tạo MSP payload bằng `MSPParser.pack_msg()` → gửi qua `WifiWorker`
+1. Tạo `ui/new_tab.py` kế thừa `QWidget`
+2. Import + thêm vào `_create_pages()` trong `main_window.py`
+3. Logic Signal/Slot trong `GCSApp` (`main.py`)
 
 ---
 
-## 11. Chạy & Test
+## 13. Chạy & Test
 
-```bash
-# Chạy ứng dụng chính
+```powershell
+# Chạy ứng dụng
 python main.py
 
-# Chạy test kiểm tra widget names
-python _test_ui_refactor.py
+# Chạy unit tests
+python -m pytest tests/ -v --tb=short
+
+# Kết quả mong đợi: 116 passed, 3 xfailed
 ```
 
-- Khi chạy `main.py`, dialog kết nối hiện ra đầu tiên
-- Chọn **"🧪 Mock Test"** để test UI không cần phần cứng
-- Chọn **"🛜 Kết Nối Wifi"** để kết nối ESP32 thật
-
 ---
 
-## 12. Ánh Xạ Kênh AUX (MSP_SET_RAW_RC)
-
-Thứ tự kênh (Chuẩn INAV AETR): `[Roll, Pitch, Throttle, Yaw, AUX1, AUX2, AUX3, AUX4]`
-
-| Kênh | FC Channel | Chức năng | 1000 | 1500 | 2000 |
-|---|---|---|---|---|---|
-| AUX1 | CH5 | ARM/DISARM | DISARM | — | ARM |
-| AUX2 | CH6 | Flight Mode | Acro | ANGLE | ALTHOLD+POSHOLD |
-| AUX3 | CH7 | Safe Land | OFF | — | Kích hoạt hạ cánh |
-| AUX4 | CH8 | RTH | OFF | — | Kích hoạt RTH |
-
----
-
-## 13. Lịch Sử Thay Đổi
+## 14. Lịch Sử Thay Đổi
 
 | Ngày | Mô tả |
 |---|---|
-| 2026-03-30 | **Refactoring kiến trúc lớn**: Tách monolithic code thành module riêng biệt. Tạo `MainWindow`, `DashboardTab`, `MissionTab`, `ConfigTab`. GCSApp kế thừa MainWindow. |
-| 2026-03-30 | Cập nhật AGENT.md toàn diện với đầy đủ context cho AI agent. |
-| 2026-04-05 | **Feature Update lớn**: ESP32 failsafe chủ động (RTH/SafeLand), Emergency Overlay, Takeoff Dialog (nhập độ cao + GPS), Mission Tab với OpenStreetMap (folium + QWebEngineView), MSP_RAW_GPS + MSP_SET_WP, AUX channel mapping mới (4 AUX), DroneState GPS fields, cấu hình failsafe từ PC. |
-| 2026-04-09 | **MTF-02 LiDAR Integration**: Thêm MSP_SONAR_ALTITUDE (58), sensor fusion (LiDAR ≤2.5m / Baro), LiDAR-assisted takeoff + soft landing, Dashboard hiển thị Surface Alt + Quality. QA: buffer overflow protection, thread safety fix, ESP32 gc.collect() + yield, 13 unit tests passed. |
-| 2026-04-10 | **Critical Bug Fixes & Refactor**: Audit firmware ESP32; sửa lỗi Failsafe đóng socket gây mất quyền Emergency. Sửa channel order thành chuẩn AETR. Thêm giao thức khẩn cấp prefix `EM:` cho phép ESP32 ưu tiên xử lý lệnh DISARM bỏ qua queue TCP. Cải thiện độ ổn định kết nối. Sửa Leaflet Map init race condition bằng pure HTML/JS thay vì folium. |
+| 2026-03-30 | **Refactoring kiến trúc lớn**: Tách monolithic code thành module. Tạo `MainWindow`, `DashboardTab`, `MissionTab`, `ConfigTab`. GCSApp kế thừa MainWindow. |
+| 2026-04-05 | **Feature Update lớn**: ESP32 failsafe chủ động, Emergency Overlay, Takeoff Dialog, Mission Tab + OpenStreetMap, MSP_RAW_GPS + MSP_SET_WP, AUX channel mapping mới. |
+| 2026-04-09 | **MTF-02 LiDAR Integration**: MSP_SONAR_ALTITUDE, sensor fusion, LiDAR display, buffer overflow protection, 13 unit tests. |
+| 2026-04-10 | **Critical Bug Fixes**: Sửa failsafe đóng socket gây mất quyền Emergency. Sửa channel order thành AETR. Thêm `EM:` emergency protocol. Sửa Leaflet race condition. |
+| 2026-04-13 | **DISARM Fix + PING/ACK System**: Thay fire-and-forget bằng repeated-send state machine (DISARMING/FORCE_DISARMING). Thêm PING/PONG, ACK:EM/FS/RC. Thêm ping label top bar. 116 tests passed. |
 
 ---
 
-## 14. Đề xuất Skills (Agent Skills)
+## 15. Skills Khuyến Nghị
 
-Danh sách toàn diện các kỹ năng (skills) nên được AI Agent sử dụng tùy theo bài toán (VD: `@python-pro`, `@firmware-analyst`, `@systematic-debugging`...) đã được liệt kê và giải thích chi tiết trong file riêng biệt.
+Xem chi tiết tại [`RECOMMENDED_SKILLS.md`](file:///c:/DroneGCS/RECOMMENDED_SKILLS.md).
 
-👉 **Vui lòng đọc file:** [`RECOMMENDED_SKILLS.md`](file:///c:/DroneGCS/RECOMMENDED_SKILLS.md) để biết khi nào nên gọi skill nào trong quá trình phát triển hệ thống DroneGCS.
+**Tóm tắt nhanh:**
+- Debug FC behavior → `@firmware-analyst`, `@systematic-debugging`
+- Viết code → `@python-pro`, `@react-patterns` (PySide6 tương tự)
+- Review thay đổi lớn → `@code-reviewer`, `@architect-review`
+- Unit tests → `@tdd-workflow`

@@ -20,7 +20,7 @@ class WifiClient:
     """
 
     # Thời gian chờ đọc dữ liệu mặc định (giây)
-    DEFAULT_TIMEOUT = 0.2
+    DEFAULT_TIMEOUT = 0.05
     # Kích thước buffer đọc (bytes)
     RECV_BUFFER_SIZE = 1024
 
@@ -50,6 +50,7 @@ class WifiClient:
             OSError: Khi có lỗi hệ thống mạng.
         """
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # Disable Nagle's algorithm
         self._sock.settimeout(self.DEFAULT_TIMEOUT)
         self._sock.connect((self.ip, self.port))
 

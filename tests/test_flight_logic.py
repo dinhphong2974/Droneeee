@@ -261,7 +261,12 @@ class MockWorker:
 
 
 def test_force_disarm_stops_state_machine():
-    """14. force_disarm() phải stop timer VÀ set IDLE ngay lập tức"""
+    """14. force_disarm() phải chuyển sang FORCE_DISARMING và khởi động timer repeated-send.
+
+    Behavior mới (FIX): Không còn fire-and-forget. force_disarm() chuyển sang
+    state FORCE_DISARMING → timer 10Hz tiếp tục gửi DISARM qua emergency queue
+    cho đến khi FC xác nhận is_armed=False hoặc timeout 5s.
+    """
     fc = FlightController(MockDroneState())
     fc._worker = MockWorker()
 
@@ -271,8 +276,12 @@ def test_force_disarm_stops_state_machine():
 
     fc.force_disarm()
 
-    assert fc._state == "IDLE"
-    assert not fc._timer.isActive()
+    # Behavior mới: state phải là FORCE_DISARMING (không phải IDLE ngay lập tức)
+    # Timer cũng sẽ chạy repeated-send, nhưng không kiểm tra isActive() vì
+    # QTimer cần Qt event loop đang chạy trong môi trường test
+    assert fc._state == "FORCE_DISARMING"
+
+    fc._timer.stop()  # Cleanup
 
 
 def test_force_disarm_nav_off_sequence():
@@ -350,8 +359,13 @@ def test_safe_land_stops_takeoff_timer():
     fc._timer.stop()  # Cleanup
 
 
-def test_disarm_sets_idle_before_stop():
-    """18. disarm() phải set state IDLE trước khi stop timer (race condition guard)"""
+def test_disarm_sets_disarming_state():
+    """18. disarm() phải chuyển sang state DISARMING với timer đang chạy (repeated-send).
+
+    Behavior mới (FIX): Không còn fire-and-forget → IDLE. disarm() chuyển sang
+    state DISARMING → timer 10Hz gửi DISARM liên tục cho đến khi FC xác nhận
+    is_armed=False (qua telemetry MSP_STATUS) hoặc timeout 5s.
+    """
     fc = FlightController(MockDroneState())
     fc._worker = MockWorker()
 
@@ -359,8 +373,21 @@ def test_disarm_sets_idle_before_stop():
 
     fc.disarm()
 
+    # Behavior mới: state DISARMING (không phải IDLE ngay lập tức)
+    # Timer cũng sẽ chạy repeated-send, nhưng không kiểm tra isActive() vì
+    # QTimer cần Qt event loop đang chạy trong môi trường test
+    assert fc._state == "DISARMING"
+
+    # Simulate: FC xác nhận DISARM → tick() chuyển về IDLE
+    state = MockDroneState()
+    state.is_armed = False  # FC đã DISARM
+    fc._drone_state = state
+    fc._tick()  # Trigger 1 tick
+
     assert fc._state == "IDLE"
     assert not fc._timer.isActive()
+
+    fc._timer.stop()  # Cleanup
 
 
 def test_emergency_queue_cleared_on_force_disarm():

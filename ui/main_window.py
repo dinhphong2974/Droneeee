@@ -231,6 +231,19 @@ class MainWindow(QMainWindow):
         # ── Khoảng trống giãn ──
         h_layout.addItem(QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
 
+        # ── Ping (RTT GCS↔ESP32) ──
+        self.lbl_ping_title = QLabel("Ping:")
+        self.lbl_ping_title.setStyleSheet("color: #808098;")
+        h_layout.addWidget(self.lbl_ping_title)
+
+        self.lbl_ping = QLabel("🏓 ---ms")
+        self.lbl_ping.setFont(self._bold_font)
+        self.lbl_ping.setStyleSheet("color: #808098;")
+        self.lbl_ping.setMinimumWidth(90)
+        h_layout.addWidget(self.lbl_ping)
+
+        h_layout.addItem(QSpacerItem(20, 20, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum))
+
         # ── Nhóm WiFi ──
         self.lbl_wifi_status = QLabel("WiFi Status:")
         self.lbl_wifi_status.setStyleSheet("color: #808098;")

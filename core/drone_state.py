@@ -71,6 +71,7 @@ class DroneState:
 
         # ── Trạng thái kết nối ──
         self.is_connected: bool = False
+        self.ping_rtt_ms: int = -1          # RTT GCS↔ESP32 (ms), -1 = chưa đo
 
         # ── Trạng thái mode bay hiện tại (cho emergency overlay) ──
         self.active_mode_name: str = ""     # Tên mode đang chạy (ARM, Takeoff, Mission...)
