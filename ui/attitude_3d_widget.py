@@ -10,8 +10,8 @@ Tính năng:
 """
 
 import os
-from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtWidgets import QWidget, QSizePolicy
+from PySide6.QtCore import QTimer, Qt, QSize
 
 # Import thư viện Panda3D
 from panda3d.core import (
@@ -45,6 +45,7 @@ class Panda3DEngine(ShowBase):
         props.setParentWindow(parent_hwnd)
         props.setOrigin(0, 0)
         props.setSize(max(1, width), max(1, height))
+        props.setUndecorated(True)  # FIX: Tránh Panda3D hiểu nhầm và bù trừ viền cửa sổ
         
         self.makeDefaultPipe()
         self.openDefaultWindow(props=props)
@@ -152,13 +153,20 @@ class Panda3DEngine(ShowBase):
     def update_attitude_smooth(self, alpha: float = 0.2):
         self.current_roll = (1 - alpha) * self.current_roll + alpha * self.target_roll
         self.current_pitch = (1 - alpha) * self.current_pitch + alpha * self.target_pitch
-        self.current_yaw = (1 - alpha) * self.current_yaw + alpha * self.target_yaw
+
+        # FIX: Normalize yaw difference — shortest-path interpolation
+        # Tránh jump 360° khi yaw chuyển từ 359° → 1° (hoặc ngược lại)
+        yaw_diff = self.target_yaw - self.current_yaw
+        if yaw_diff > 180:
+            yaw_diff -= 360
+        elif yaw_diff < -180:
+            yaw_diff += 360
+        self.current_yaw = (self.current_yaw + alpha * yaw_diff) % 360
 
         self.attitude_node.setHpr(
             -self.current_yaw,   # Yaw
             self.current_roll,    # Roll
-            self.current_pitch  # Pitch
-            
+            self.current_pitch   # Pitch
         )
 
 
@@ -168,6 +176,11 @@ class Attitude3DWidget(QWidget):
     def __init__(self, parent=None, model_filename: str = "drone.glb"):
         super().__init__(parent)
         self.setMinimumSize(400, 300)
+
+        # FIX: Expanding policy + sizeHint — ngăn QSplitter co widget về minimumSize
+        # Khi maximize→restore, Qt hỏi sizeHint() để tính kích thước. Nếu không
+        # override, default sizeHint = (-1,-1) → Qt dùng minimumSize → co dần.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # 1. Lấy thư mục chứa file attitude_3d_widget.py (thư mục 'ui')
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -194,6 +207,10 @@ class Attitude3DWidget(QWidget):
         self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self._step_panda)
 
+    def sizeHint(self):
+        """Trả về kích thước mong muốn lớn — cho QSplitter biết widget cần nhiều không gian."""
+        return QSize(800, 600)
+
     def showEvent(self, event):
         super().showEvent(event)
         if self.panda_engine is None:
@@ -213,9 +230,15 @@ class Attitude3DWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # FIX: Explicitly set Origin = (0, 0) and size synchronously.
+        # Khi ấn restore (thu nhỏ lại từ fullscreen), Windows/PySide6 có thể đổi
+        # tọa độ render của HWND con. Việc gọi setOrigin(0,0) ép Panda3D luôn bám sát
+        # góc trên-trái của Attitude3DWidget.
         if self.panda_engine and self.panda_engine.win:
             props = WindowProperties()
+            props.setOrigin(0, 0)
             props.setSize(max(1, self.width()), max(1, self.height()))
+            props.setUndecorated(True)  # FIX: Ngăn Windows dịch HWND do bù trừ viền (góc dưới phải)
             self.panda_engine.win.requestProperties(props)
 
     def closeEvent(self, event):

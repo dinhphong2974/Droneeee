@@ -1,0 +1,23 @@
+{
+  "assets/leaflet/leaflet.js": "5819285cec137b229c94e1ee5ad73e8b6b84345a4367d60f75fe477fe0fb7b03",
+  "comm/msp_parser.py": "9a436093413b1833d49da6cbdeb3aa9d920c2bbf5e0cb8383757cb401d11af60",
+  "comm/wifi_client.py": "194606d7278d8d2ea5812c76f75c94c5ac3c96052b24691261c0fff55755f5b0",
+  "comm/wifi_worker.py": "41acb205573785885bd655ae3bef2a806c7bedbccded0c37834e595ce20e128a",
+  "comm/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "core/drone_state.py": "78a382d63134a74b8012fd9111fadd1c5e5aa7ec965777ac07c44e90e72c4541",
+  "core/flight_controller.py": "2f5a78f750cd62a109e8b0f7487fd7041bb5194513019069fad7499e3916c064",
+  "core/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "ESP32/main.py": "6a7ab226ab2c02dc3ec0671c6f2ce07605e2c1f9b9347d19a7f0c74a0649745a",
+  "main.py": "6920a8fff6f41ec8730c6eac9d32b39dd8ff324e0f1d9db9ce83238e904625ef",
+  "tests/test_flight_logic.py": "f4a497fbe96684e557b64ff4f1966aca96c235c91302d05a0b0a56048d034bcb",
+  "tests/test_msp_noise_robustness.py": "a2940e30e7e4603242a705592ca934be7008a4cdc657206229c356f0f1de1d9a",
+  "ui/attitude_3d_widget.py": "bd8d88c87de5634f556b4305ce15e1bef9d4b5a23f3c4354f89967fb9ba49976",
+  "ui/config_tab.py": "24cf3125535627c08319cb9f17a4c3ad85eba210dc90f5c1435b9ebfe2ea28f4",
+  "ui/dashboard_tab.py": "ecb1d0262c19ac47126adb533ca6e9290605a2f03d69ae07f01bd1a064e9fbd6",
+  "ui/emergency_overlay.py": "81cec210312e708f442b26cc311006c2dcd3d49f9f4d65d95d84a78036658d09",
+  "ui/gcs_dashboard.py": "ba4be9717dd9b2025739e26e5bc1374fe093ad506766bbad16b1c41ac6270078",
+  "ui/main_window.py": "67c7e1a96ba4c9200dcecf26dad9717c4d50ebe1ae0642e6efffaf4416002cf4",
+  "ui/manual_control_tab.py": "17776167402e725b05400e8d9caf718657afa164ebef7e83a9a57cd54df053b1",
+  "ui/mission_tab.py": "219f7726eee8a5845049416b9927db39967302dfa2d771f6b19749fe8e7b883d",
+  "ui/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

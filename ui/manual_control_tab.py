@@ -47,6 +47,17 @@ class ManualControlTab(QWidget):
         )
         layout.addWidget(self.btn_takeoff_hold)
 
+        # ── Nút Manual Takeoff (ANGLE → Ramp → NAV) ──
+        self.btn_manual_takeoff = QPushButton("🛫 Manual Takeoff")
+        self.btn_manual_takeoff.setMinimumHeight(44)
+        self.btn_manual_takeoff.setStyleSheet(
+            "QPushButton { background-color: #2196F3; color: white; font-weight: bold; "
+            "font-size: 14px; border-radius: 6px; } "
+            "QPushButton:hover { background-color: #1976D2; } "
+            "QPushButton:disabled { background-color: #555; color: #888; }"
+        )
+        layout.addWidget(self.btn_manual_takeoff)
+
         # ── Flight Status ──
         status_layout = QHBoxLayout()
         self.lbl_flight_status = QLabel("Flight Status:")

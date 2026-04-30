@@ -54,8 +54,14 @@ class DashboardTab(QWidget):
         right_layout.addStretch()
         splitter.addWidget(right_panel)
 
-        # Tỷ lệ mặc định 65:35
-        splitter.setSizes([650, 350])
+        # FIX: Dùng stretch factor (tỉ lệ) thay vì setSizes (pixel tuyệt đối)
+        # setSizes lưu kích thước cố định → mỗi lần maximize/restore bị co lại dần
+        splitter.setStretchFactor(0, 65)   # Attitude 3D: 65 phần
+        splitter.setStretchFactor(1, 35)   # Telemetry panel: 35 phần
+
+        # FIX: Không cho phép collapse → tránh co về 0 khi resize nhanh
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
 
         layout.addWidget(splitter)
 
@@ -100,6 +106,7 @@ class DashboardTab(QWidget):
             ("lbl_yaw",         "Yaw",          "val_yaw"),
             ("lbl_gps_fix",     "GPS Fix",      "val_gps_fix"),
             ("lbl_sats",        "🛰 Satellites","val_sats"),
+            ("lbl_gps_accuracy","Accuracy",     "val_gps_accuracy"),
             ("lbl_spd",         "Ground Speed", "val_spd"),
             ("lbl_surface_alt", "📡 Surface Alt","val_surface_alt"),
             ("lbl_lidar_qual",  "LiDAR Quality","val_lidar_qual"),

@@ -25,6 +25,24 @@ class MockDroneState:
         self.surface_altitude = -1.0
         self.surface_quality = 0
         self.has_valid_surface = False
+        # ── v3: Sensor health fields ──
+        self.sensor_opflow = False
+        self.sensor_rangefinder = False
+        # ── v3: GPS history ──
+        self._gps_history = []
+
+    def get_stable_gps(self):
+        """Mock get_stable_gps — trả về trung bình hoặc None."""
+        if len(self._gps_history) < 10:
+            return None
+        avg_lat = sum(p[0] for p in self._gps_history) / len(self._gps_history)
+        avg_lon = sum(p[1] for p in self._gps_history) / len(self._gps_history)
+        return (avg_lat, avg_lon)
+
+    def record_gps_history(self):
+        """Mock record_gps_history."""
+        if self.latitude != 0.0:
+            self._gps_history.append((self.latitude, self.longitude))
 
 
 # ══════════════════════════════════════════════
@@ -158,16 +176,16 @@ def test_msp_sonar_altitude_checksum_error():
 # ══════════════════════════════════════════════
 
 def test_effective_altitude_uses_lidar_when_in_range():
-    """8. Sensor Fusion: dùng LiDAR khi ≤2.5m và dữ liệu hợp lệ"""
+    """8. Sensor Fusion: dùng LiDAR khi ≤1m (LIDAR_TRUST_RANGE_M) và dữ liệu hợp lệ"""
     state = MockDroneState()
     state.altitude = 2.0         # Barometer: 2.0m
-    state.surface_altitude = 1.8  # LiDAR: 1.8m (chính xác hơn)
+    state.surface_altitude = 0.8  # LiDAR: 0.8m (trong tầm tin cậy ≤1m)
     state.has_valid_surface = True
 
     fc = FlightController(state)
     
-    # Phải chọn LiDAR vì trong tầm 2.5m
-    assert abs(fc._effective_altitude - 1.8) < 0.01
+    # Phải chọn LiDAR vì trong tầm 1.0m
+    assert abs(fc._effective_altitude - 0.8) < 0.01
 
 
 def test_effective_altitude_uses_baro_when_out_of_range():
@@ -184,15 +202,15 @@ def test_effective_altitude_uses_baro_when_out_of_range():
 
 
 def test_effective_altitude_uses_baro_when_lidar_exceeds_max():
-    """10. Sensor Fusion: dùng Barometer khi LiDAR vượt tầm tối đa"""
+    """10. Sensor Fusion: dùng Barometer khi LiDAR vượt tầm tin cậy (>1m)"""
     state = MockDroneState()
     state.altitude = 3.0          # Barometer: 3.0m
-    state.surface_altitude = 3.0  # LiDAR đọc 3.0m (vượt LIDAR_MAX_RANGE_M=2.5m)
+    state.surface_altitude = 1.5  # LiDAR đọc 1.5m (vượt LIDAR_TRUST_RANGE_M=1.0m)
     state.has_valid_surface = True
 
     fc = FlightController(state)
     
-    # LiDAR đọc 3.0m > 2.5m max range → phải dùng Barometer
+    # LiDAR đọc 1.5m > 1.0m trust range → phải dùng Barometer
     assert abs(fc._effective_altitude - 3.0) < 0.01
 
 
@@ -237,10 +255,11 @@ def test_lidar_constants():
     fc = FlightController(MockDroneState())
     
     assert fc.LIDAR_MAX_RANGE_M == 2.5
+    assert fc.LIDAR_TRUST_RANGE_M == 1.0
     assert fc.LIDAR_SOFT_LAND_THRESHOLD == 1.0
     assert fc.LIDAR_GROUND_PROXIMITY == 0.15
     assert fc.LIDAR_GROUND_PROXIMITY < fc.LIDAR_SOFT_LAND_THRESHOLD
-    assert fc.LIDAR_SOFT_LAND_THRESHOLD < fc.LIDAR_MAX_RANGE_M
+    assert fc.LIDAR_TRUST_RANGE_M <= fc.LIDAR_MAX_RANGE_M
 
 
 # ══════════════════════════════════════════════
@@ -271,7 +290,7 @@ def test_force_disarm_stops_state_machine():
     fc._worker = MockWorker()
 
     # Giả lập đang takeoff
-    fc._state = "THROTTLE_RAMP"
+    fc._state = "NAV_CLIMB"
     fc._timer.start(fc.TICK_INTERVAL_MS)
 
     fc.force_disarm()
@@ -290,7 +309,7 @@ def test_force_disarm_nav_off_sequence():
     worker = MockWorker()
     fc._worker = worker
 
-    fc._state = "THROTTLE_RAMP"
+    fc._state = "NAV_CLIMB"
 
     fc.force_disarm()
 
@@ -321,7 +340,7 @@ def test_force_safe_land_state_transition():
     fc._worker = worker
 
     # Giả lập đang takeoff
-    fc._state = "THROTTLE_RAMP"
+    fc._state = "NAV_CLIMB"
 
     fc.force_safe_land()
 
@@ -342,29 +361,34 @@ def test_force_safe_land_state_transition():
 
 
 def test_safe_land_stops_takeoff_timer():
-    """17. safe_land() thường phải stop timer trước khi activate"""
+    """17. safe_land() phải chuyển qua NAV_OFF_BEFORE_SAFE_LAND trước SAFE_LANDING"""
     fc = FlightController(MockDroneState())
     worker = MockWorker()
     fc._worker = worker
 
     # Giả lập đang takeoff với timer chạy
-    fc._state = "THROTTLE_RAMP"
+    fc._state = "NAV_CLIMB"
     fc._timer.start(fc.TICK_INTERVAL_MS)
 
     fc.safe_land()
 
-    # Timer phải restart ở state mới (SAFE_LANDING)
+    # State phải là NAV_OFF_BEFORE_SAFE_LAND (chờ 300ms tắt NAV)
+    assert fc._state == "NAV_OFF_BEFORE_SAFE_LAND"
+
+    # Simulate 300ms trôi qua → tick chuyển sang SAFE_LANDING
+    import time as _time
+    fc._safe_land_start_time = _time.time() - 0.5  # Quá 300ms
+    fc._tick()
     assert fc._state == "SAFE_LANDING"
 
     fc._timer.stop()  # Cleanup
 
 
 def test_disarm_sets_disarming_state():
-    """18. disarm() phải chuyển sang state DISARMING với timer đang chạy (repeated-send).
+    """18. disarm() phải chuyển qua NAV_OFF_BEFORE_DISARM trước DISARMING.
 
-    Behavior mới (FIX): Không còn fire-and-forget → IDLE. disarm() chuyển sang
-    state DISARMING → timer 10Hz gửi DISARM liên tục cho đến khi FC xác nhận
-    is_armed=False (qua telemetry MSP_STATUS) hoặc timeout 5s.
+    Behavior mới (FIX v2): disarm() chuyển sang NAV_OFF_BEFORE_DISARM →
+    chờ 300ms tắt NAV → DISARMING → chờ FC xác nhận DISARM → IDLE.
     """
     fc = FlightController(MockDroneState())
     fc._worker = MockWorker()
@@ -373,16 +397,20 @@ def test_disarm_sets_disarming_state():
 
     fc.disarm()
 
-    # Behavior mới: state DISARMING (không phải IDLE ngay lập tức)
-    # Timer cũng sẽ chạy repeated-send, nhưng không kiểm tra isActive() vì
-    # QTimer cần Qt event loop đang chạy trong môi trường test
+    # Bước 1: Phải ở NAV_OFF_BEFORE_DISARM (không phải DISARMING ngay)
+    assert fc._state == "NAV_OFF_BEFORE_DISARM"
+
+    # Bước 2: Simulate 300ms trôi qua → chuyển sang DISARMING
+    import time as _time
+    fc._disarm_start_time = _time.time() - 0.5  # Quá 300ms
+    fc._tick()
     assert fc._state == "DISARMING"
 
-    # Simulate: FC xác nhận DISARM → tick() chuyển về IDLE
+    # Bước 3: Simulate FC xác nhận DISARM → IDLE
     state = MockDroneState()
-    state.is_armed = False  # FC đã DISARM
+    state.is_armed = False
     fc._drone_state = state
-    fc._tick()  # Trigger 1 tick
+    fc._tick()
 
     assert fc._state == "IDLE"
     assert not fc._timer.isActive()
@@ -411,3 +439,269 @@ def test_emergency_queue_cleared_on_force_disarm():
     cmd = worker._emergency_queue.get_nowait()
     assert cmd == b'EMERGENCY'
 
+
+# ══════════════════════════════════════════════
+# TESTS v3 — TAKEOFF OPTIMIZATION
+# ══════════════════════════════════════════════
+
+def test_armed_wait_keeps_angle_and_idle():
+    """20. v3 B1: _handle_armed_wait() phải giữ AUX2=ANGLE(1500) + Throttle=IDLE(1000).
+    
+    KHÔNG được bật AUX2=2000 (NAV_WP) trước khi upload WP.
+    """
+    state = MockDroneState()
+    state.is_armed = True
+    fc = FlightController(state)
+    worker = MockWorker()
+    fc._worker = worker
+
+    # Giả lập vào ARMED_WAIT
+    fc._state = "ARMED_WAIT"
+    fc._armed_wait_start = 0  # Đã hết thời gian chờ
+    fc._tick()  # Trigger 1 tick
+
+    # Phải đã chuyển sang WP_UPLOAD
+    assert fc._state == "WP_UPLOAD"
+    # Kiểm tra channels trước khi transition
+    assert fc._channels[fc.CH_AUX2] == fc.AUX_ANGLE         # 1500 — KHÔNG phải 2000!
+    assert fc._channels[fc.CH_THROTTLE] == fc.THROTTLE_MIN   # 1000 — KHÔNG phải 1500!
+
+    fc._timer.stop()
+
+
+def test_wp_activate_rising_edge():
+    """21. v3 B4: AUX2 chỉ được = 2000 SAU khi WP_ACTIVATE delay hết.
+    
+    Trước delay: AUX2=1500 (ANGLE). Sau delay: AUX2=2000 (NAV_WP).
+    Đây là 'rising edge' để INAV nhận diện trigger NAV_WP.
+    """
+    import time as _time
+    state = MockDroneState()
+    state.is_armed = True
+    fc = FlightController(state)
+    worker = MockWorker()
+    fc._worker = worker
+
+    # Giả lập đang ở WP_ACTIVATE, vừa mới upload (chưa hết delay)
+    fc._state = "WP_ACTIVATE"
+    fc._wp_upload_time = _time.time()  # Vừa bắt đầu
+    fc._tick()
+
+    # Chưa hết delay → phải giữ ANGLE + Idle
+    assert fc._state == "WP_ACTIVATE"  # Chưa chuyển
+    assert fc._channels[fc.CH_AUX2] == fc.AUX_ANGLE
+    assert fc._channels[fc.CH_THROTTLE] == fc.THROTTLE_MIN
+
+    # Giả lập hết delay
+    fc._wp_upload_time = _time.time() - 2.0  # 2s trước
+    fc._tick()
+
+    # Hết delay → phải bung 2000 + 1500
+    assert fc._state == "NAV_CLIMB"
+    assert fc._channels[fc.CH_AUX2] == fc.AUX_NAV_ALTHOLD_POSHOLD  # 2000!
+    assert fc._channels[fc.CH_THROTTLE] == fc.RC_CENTER             # 1500!
+
+    fc._timer.stop()
+
+
+def test_altitude_reached_waits_1s():
+    """22. v3 B5: ALTITUDE_REACHED phải chờ 1 giây trước khi sang HOLDING.
+    
+    Drone 3.5-inch cần thời gian PID settle sau khi đạt độ cao.
+    """
+    import time as _time
+    state = MockDroneState()
+    state.is_armed = True
+    state.altitude = 3.0
+    fc = FlightController(state)
+    worker = MockWorker()
+    fc._worker = worker
+
+    # Vừa mới đạt độ cao
+    fc._state = "ALTITUDE_REACHED"
+    fc._reached_alt_time = _time.time()  # Vừa bắt đầu
+    fc._tick()
+
+    # Chưa đủ 1s → PHẢI vẫn ở ALTITUDE_REACHED
+    assert fc._state == "ALTITUDE_REACHED"
+
+    # Giả lập đã qua 1s
+    fc._reached_alt_time = _time.time() - 1.5
+    fc._tick()
+
+    # Đã đủ 1s → phải sang HOLDING (KHÔNG phải IDLE!)
+    assert fc._state == "HOLDING"
+
+    fc._timer.stop()
+
+
+def test_gps_drift_aborts_takeoff():
+    """23. v3 B7: GPS trôi > 3m giữa stable_gps và tức thời → abort."""
+    state = MockDroneState()
+    state.is_armed = True
+    state.gps_fix_type = 2
+    state.gps_num_sat = 10
+    # GPS tức thời ở Hà Nội
+    state.latitude = 21.028500
+    state.longitude = 105.854200
+    # GPS history ở vị trí khác (cách ~50m)
+    for _ in range(15):
+        state._gps_history.append((21.028900, 105.854200))
+
+    fc = FlightController(state)
+    worker = MockWorker()
+    fc._worker = worker
+    errors = []
+    fc.error_occurred.connect(lambda msg: errors.append(msg))
+
+    import time as _time
+    fc._state = "WP_UPLOAD"
+    fc._wp_upload_time = _time.time()  # Chưa timeout → Haversine check sẽ chạy
+    fc._tick()
+
+    # Phải abort do GPS drift > 3m
+    assert fc._state == "IDLE"
+    assert len(errors) > 0
+    assert "GPS trôi" in errors[0] or "multipath" in errors[0]
+
+    fc._timer.stop()
+
+
+def test_wp_upload_timeout():
+    """24. v3 B8: WP_UPLOAD kẹt quá WP_UPLOAD_TIMEOUT_S → abort."""
+    import time as _time
+    state = MockDroneState()
+    state.is_armed = True
+    state.gps_fix_type = 2
+    state.gps_num_sat = 10
+    # KHÔNG cho GPS history đủ 10 mẫu → get_stable_gps() trả None
+
+    fc = FlightController(state)
+    worker = MockWorker()
+    fc._worker = worker
+    errors = []
+    fc.error_occurred.connect(lambda msg: errors.append(msg))
+
+    fc._state = "WP_UPLOAD"
+    fc._wp_upload_time = _time.time() - 10.0  # 10s trước — vượt timeout 3s
+    fc._tick()
+
+    assert fc._state == "IDLE"
+    assert len(errors) > 0
+    assert "GPS" in errors[0]
+
+    fc._timer.stop()
+
+
+def test_gps_history_reset_on_takeoff():
+    """25. v3 T1: takeoff_and_hold() phải clear _gps_history cũ."""
+    state = MockDroneState()
+    state.latitude = 21.028500
+    state.longitude = 105.854200
+    # Nhét GPS cũ
+    for _ in range(15):
+        state._gps_history.append((21.028500, 105.854200))
+    assert len(state._gps_history) == 15
+
+    fc = FlightController(state)
+    worker = MockWorker()
+    fc._worker = worker
+
+    fc.takeoff_and_hold(3.0)
+
+    # _gps_history phải đã bị clear
+    assert len(state._gps_history) == 0
+
+    fc._timer.stop()
+
+
+# ══════════════════════════════════════════════
+# TESTS v4 — MANUAL TAKEOFF
+# ══════════════════════════════════════════════
+
+def test_manual_takeoff_sets_flag():
+    """26. manual_takeoff_and_hold() phải set _is_manual_takeoff=True."""
+    state = MockDroneState()
+    fc = FlightController(state)
+    fc._worker = MockWorker()
+
+    fc.manual_takeoff_and_hold(5.0)
+
+    assert fc._is_manual_takeoff is True
+    assert fc._state == "PRE_ARM_CHECK"
+    assert len(state._gps_history) == 0  # GPS history đã clear
+
+    fc._timer.stop()
+
+
+def test_manual_armed_wait_branches_to_manual():
+    """27. _handle_armed_wait() phân nhánh sang MANUAL_ANGLE_IDLE khi _is_manual_takeoff=True."""
+    state = MockDroneState()
+    state.is_armed = True
+    fc = FlightController(state)
+    fc._worker = MockWorker()
+
+    fc._is_manual_takeoff = True
+    fc._state = "ARMED_WAIT"
+    fc._armed_wait_start = 0  # Hết thời gian chờ
+    fc._tick()
+
+    assert fc._state == "MANUAL_ANGLE_IDLE"
+
+    fc._timer.stop()
+
+
+def test_manual_ramp_throttle_increases():
+    """28. MANUAL_THROTTLE_RAMP phải tăng throttle mỗi tick."""
+    state = MockDroneState()
+    state.is_armed = True
+    fc = FlightController(state)
+    fc._worker = MockWorker()
+
+    fc._state = "MANUAL_THROTTLE_RAMP"
+    fc._manual_ramp_throttle = 1000
+    import time as _time
+    fc._manual_stage_start = _time.time()
+    fc._tick()
+
+    assert fc._manual_ramp_throttle == 1050  # 1000 + MANUAL_RAMP_STEP(50)
+    assert fc._channels[fc.CH_THROTTLE] == 1050
+
+    fc._timer.stop()
+
+
+def test_manual_abort_resets_flag():
+    """29. _abort() phải reset _is_manual_takeoff=False."""
+    state = MockDroneState()
+    fc = FlightController(state)
+    fc._worker = MockWorker()
+    fc._is_manual_takeoff = True
+    errors = []
+    fc.error_occurred.connect(lambda msg: errors.append(msg))
+
+    fc._abort("Test abort")
+
+    assert fc._is_manual_takeoff is False
+    assert fc._state == "IDLE"
+
+    fc._timer.stop()
+
+
+def test_manual_constants_valid():
+    """30. Hằng số Manual Takeoff hợp lệ cho drone 3.5-inch 6S."""
+    fc = FlightController(MockDroneState())
+
+    assert fc.MANUAL_HOVER_THROTTLE == 1400
+    assert fc.MANUAL_CLIMB_THROTTLE == 1600
+    assert fc.MANUAL_RAMP_STEP == 50
+    assert fc.MANUAL_MIN_SWITCH_ALT == 2.0
+    assert fc.MANUAL_ANGLE_IDLE_S == 1.0
+    assert fc.MANUAL_NAV_SETTLE_S == 1.5
+    # Climb throttle phải > hover throttle
+    assert fc.MANUAL_CLIMB_THROTTLE > fc.MANUAL_HOVER_THROTTLE
+
+
+def test_nav_off_delay_constant():
+    """31. Hằng số NAV_OFF_DELAY_S phải là 300ms."""
+    fc = FlightController(MockDroneState())
+    assert fc.NAV_OFF_DELAY_S == 0.3

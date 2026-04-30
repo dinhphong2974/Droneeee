@@ -52,9 +52,9 @@ set nav_rth_allow_landing = ALWAYS
 set nav_wp_radius = 100
 set nav_wp_max_safe_distance = 100
 set nav_auto_speed = 300
-set nav_mc_auto_climb_rate = 200
+set nav_mc_auto_climb_rate = 350
 set nav_manual_speed = 500
-set nav_mc_manual_climb_rate = 200
+set nav_mc_manual_climb_rate = 300
 
 # ── RTH (Return To Home) ──
 set nav_rth_altitude = 1000
@@ -118,7 +118,17 @@ set dshot_beeper_enabled = OFF
 #
 
 # ─────────────────────────────────────────────────
-# 8. LƯU CẤU HÌNH
+# 8. BATTERY MONITORING — Voltage & Current
+# ─────────────────────────────────────────────────
+# SpeedyBee F405 AIO có ADC tích hợp đo điện áp/dòng
+set vbat_meter_type = ADC
+set vbat_scale = 110
+set bat_cells = 6
+set current_meter_type = ADC
+set ibata_scale = 400
+
+# ─────────────────────────────────────────────────
+# 9. LƯU CẤU HÌNH
 # ─────────────────────────────────────────────────
 
 # Sau khi cấu hình xong, gõ save và nhấn Enter.

@@ -22,6 +22,7 @@ Kiến trúc module:
 """
 
 import sys
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout,
                                 QHBoxLayout, QLineEdit, QPushButton, QLabel,
                                 QMessageBox, QDoubleSpinBox)
@@ -163,12 +164,15 @@ class TakeoffDialog(QDialog):
         btn_layout.addWidget(btn_cancel)
 
         btn_confirm = QPushButton("🚀 Cất cánh")
+        btn_confirm.setEnabled(False)  # v3 FIX T3: Disable cho đến khi GPS OK
         btn_confirm.setStyleSheet(
             "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; "
             "border-radius: 6px; padding: 10px; font-size: 13px; }"
             "QPushButton:hover { background-color: #43A047; }"
+            "QPushButton:disabled { background-color: #555; color: #888; }"
         )
         btn_confirm.clicked.connect(self._on_confirm)
+        self.btn_confirm = btn_confirm  # v3: Giữ reference để enable/disable
         btn_layout.addWidget(btn_confirm)
 
         layout.addLayout(btn_layout)
@@ -193,6 +197,9 @@ class TakeoffDialog(QDialog):
             f"📡 GPS: {fix_text} | {num_sat} sats | ({lat:.6f}, {lon:.6f})"
         )
         self.lbl_gps_info.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+        # v3 FIX T3: Chỉ cho nhấn Cất cánh khi GPS 3D Fix + 6+ sats
+        self.btn_confirm.setEnabled(fix_type >= 2 and num_sat >= 6)
 
 
 class GCSApp(MainWindow):
@@ -236,6 +243,7 @@ class GCSApp(MainWindow):
         mc.btn_arm.clicked.connect(self.flight_controller.arm)
         mc.btn_disarm.clicked.connect(self.flight_controller.disarm)
         mc.btn_takeoff_hold.clicked.connect(self._confirm_takeoff)
+        mc.btn_manual_takeoff.clicked.connect(self._confirm_manual_takeoff)
         mc.btn_rth.clicked.connect(self.flight_controller.rth)
 
         # ── Kết nối nút mission (từ MissionTab) ──
@@ -246,6 +254,15 @@ class GCSApp(MainWindow):
 
         # ── Cờ cảnh báo khoảng cách (tránh hiện dialog lặp) ──
         self._distance_warning_shown = False
+
+        # ── Cờ chống xử lý disconnect trùng lặp ──
+        self._disconnect_handled = False
+
+        # ── Timer phát hiện mất PONG (ping timeout) ──
+        self._ping_timeout_timer = QTimer(self)
+        self._ping_timeout_timer.setInterval(3000)  # 3 giây không có PONG → timeout
+        self._ping_timeout_timer.setSingleShot(True)
+        self._ping_timeout_timer.timeout.connect(self._on_ping_timeout)
 
         # Khởi chạy ở trạng thái chưa có mạng
         self.set_ui_state_na()
@@ -258,17 +275,20 @@ class GCSApp(MainWindow):
         """Xử lý nút bấm Top Bar: Mở bảng kết nối hoặc ngắt kết nối an toàn."""
         if self.worker is not None:
             # Đang có kết nối → NGẮT KẾT NỐI
+            self._disconnect_handled = True  # Chặn handle_connection_status xử lý trùng
             self.flight_controller.abort()  # Dừng bay tự động nếu đang chạy
             self.flight_controller.set_worker(None)
             self.worker.stop()
+            self.worker.wait(3000)  # Chờ tối đa 3s cho thread dọn dẹp (tránh đơ)
             self.worker = None
             self.drone_state.reset()
             self.set_ui_state_na()
             self.emergency_overlay.hide_overlay()
             self.setWindowTitle("Drone Ground Station - Đã ngắt kết nối")
-            QMessageBox.information(self, "Thông báo", "Đã ngắt kết nối với thiết bị an toàn.")
+            # Không hiện QMessageBox — người dùng đã tự nhấn nút, title bar đủ thông tin
         else:
             # Chưa có kết nối → MỞ DIALOG KẾT NỐI
+            self._disconnect_handled = False
             dialog = ConnectionDialog(self)
             if dialog.exec() == QDialog.Accepted:
                 self.start_connection(dialog.selected_ip, dialog.selected_port, dialog.is_mock_selected)
@@ -294,6 +314,7 @@ class GCSApp(MainWindow):
         self.worker.start()
 
         self._distance_warning_shown = False
+        self._disconnect_handled = False
 
     # ══════════════════════════════════════════════
     # SLOT: XỬ LÝ TÍN HIỆU TỪ WORKER
@@ -306,6 +327,10 @@ class GCSApp(MainWindow):
             self.drone_state.is_connected = True
             self.enable_ui_components()
         else:
+            # Guard: nếu toggle_connection() đã cleanup rồi → bỏ qua
+            if self._disconnect_handled or self.worker is None:
+                return
+            self._disconnect_handled = True
             # Kết nối thất bại HOẶC bị đứt giữa chừng
             self.flight_controller.abort()
             self.flight_controller.set_worker(None)
@@ -431,6 +456,12 @@ class GCSApp(MainWindow):
             dash.val_sats.setText(str(data["gps_num_sat"]))
             sat_color = "#4CAF50" if data["gps_num_sat"] >= 6 else "#FFC107"
             dash.val_sats.setStyleSheet(f"color: {sat_color}; font-weight: bold;")
+
+        if "gps_hdop" in data:
+            self.drone_state.gps_hdop = data["gps_hdop"]
+            dash.val_gps_accuracy.setText(f"{data['gps_hdop']:.2f} m")
+            acc_color = "#4CAF50" if data["gps_hdop"] < 2.5 else ("#FFC107" if data["gps_hdop"] < 5.0 else "#F44336")
+            dash.val_gps_accuracy.setStyleSheet(f"color: {acc_color}; font-weight: bold;")
 
         if "latitude" in data:
             self.drone_state.latitude = data["latitude"]
@@ -569,7 +600,7 @@ class GCSApp(MainWindow):
         labels_to_na = [
             dash.val_batt_curr, dash.val_mode, dash.val_armed, dash.val_alt,
             dash.val_lat, dash.val_lon, dash.val_roll, dash.val_pitch,
-            dash.val_yaw, dash.val_gps_fix, dash.val_sats, dash.val_spd,
+            dash.val_yaw, dash.val_gps_fix, dash.val_sats, dash.val_gps_accuracy, dash.val_spd,
             dash.val_motor1, dash.val_motor2, dash.val_motor3, dash.val_motor4,
             dash.val_surface_alt, dash.val_lidar_qual, dash.val_opflow
         ]
@@ -587,6 +618,9 @@ class GCSApp(MainWindow):
         # Reset ping label về trạng thái chưa đo
         self.lbl_ping.setText("🏓 ---ms")
         self.lbl_ping.setStyleSheet("color: #808098;")
+
+        # Dừng ping timeout timer
+        self._ping_timeout_timer.stop()
 
         self.btn_disconnect.setText("Kết nối")
         self.btn_disconnect.setStyleSheet(
@@ -623,10 +657,12 @@ class GCSApp(MainWindow):
 
     def closeEvent(self, event):
         """Đảm bảo ngắt kết nối an toàn khi người dùng đóng cửa sổ."""
+        self._ping_timeout_timer.stop()
         if self.flight_controller.is_active:
             self.flight_controller.abort()
         if self.worker:
             self.worker.stop()
+            self.worker.wait(2000)  # Chờ thread dọn xong trước khi đóng app
         event.accept()
 
     def resizeEvent(self, event):
@@ -655,6 +691,20 @@ class GCSApp(MainWindow):
             target_alt = dialog.target_altitude
             self.flight_controller.takeoff_and_hold(target_alt)
 
+    def _confirm_manual_takeoff(self):
+        """Hiện dialog nhập độ cao rồi gọi manual takeoff."""
+        dialog = TakeoffDialog(self)
+        dialog.setWindowTitle("🛩 Cấu hình Manual Takeoff")
+        dialog.update_gps_info(
+            self.drone_state.gps_fix_type,
+            self.drone_state.gps_num_sat,
+            self.drone_state.latitude,
+            self.drone_state.longitude
+        )
+        if dialog.exec() == QDialog.Accepted:
+            target_alt = dialog.target_altitude
+            self.flight_controller.manual_takeoff_and_hold(target_alt)
+
     def _on_flight_status(self, message: str):
         """Slot: Cập nhật trạng thái bay lên UI."""
         self.manual_control_tab.val_flight_status.setText(message)
@@ -669,12 +719,17 @@ class GCSApp(MainWindow):
         )
 
     def _on_flight_error(self, message: str):
-        """Slot: Lỗi bay — hiện cảnh báo và cập nhật UI."""
-        self.manual_control_tab.val_flight_status.setText(f"LỖI: {message}")
+        """
+        Slot: Lỗi bay — cập nhật status label KHÔNG hiện QMessageBox.
+
+        Lý do bỏ QMessageBox.critical: Dialog modal sẽ CHẶN TOÀN BỘ
+        tương tác UI — kể cả nút Emergency overlay. Khi drone đang bay
+        mà hiện dialog → người dùng KHÔNG THỂ bấm DISARM → nguy hiểm.
+        """
+        self.manual_control_tab.val_flight_status.setText(f"⚠️ LỖI: {message}")
         self.manual_control_tab.val_flight_status.setStyleSheet(
             "color: red; font-weight: bold;"
         )
-        QMessageBox.critical(self, "Lỗi Bay Tự Động", message)
 
     def _on_flight_state_changed(self, new_state: str):
         """Slot: State machine chuyển trạng thái — cập nhật nút Takeoff/Abort."""
@@ -692,6 +747,27 @@ class GCSApp(MainWindow):
             except RuntimeError:
                 pass
             mc.btn_takeoff_hold.clicked.connect(self._confirm_takeoff)
+            mc.btn_manual_takeoff.setEnabled(True)
+        elif new_state in ("NAV_OFF_BEFORE_DISARM", "NAV_OFF_BEFORE_SAFE_LAND"):
+            # Intermediate NAV OFF states — chỉ cập nhật status
+            mc.val_flight_status.setText(f"⏳ {new_state}")
+            mc.val_flight_status.setStyleSheet("color: #FFC107; font-weight: bold;")
+        elif new_state in ("MANUAL_ANGLE_IDLE", "MANUAL_THROTTLE_RAMP",
+                           "MANUAL_CLIMB_ANGLE", "MANUAL_SWITCH_NAV"):
+            mc.val_flight_status.setText(f"🛩 {new_state}")
+            mc.val_flight_status.setStyleSheet("color: #2196F3; font-weight: bold;")
+            mc.btn_manual_takeoff.setEnabled(False)
+            mc.btn_takeoff_hold.setText("⛔ ABORT")
+            mc.btn_takeoff_hold.setStyleSheet(
+                "QPushButton { background-color: #F44336; color: white; font-weight: bold; "
+                "font-size: 14px; border-radius: 6px; } "
+                "QPushButton:hover { background-color: #D32F2F; }"
+            )
+            try:
+                mc.btn_takeoff_hold.clicked.disconnect()
+            except RuntimeError:
+                pass
+            mc.btn_takeoff_hold.clicked.connect(self.flight_controller.abort)
         else:
             mc.btn_takeoff_hold.setText("⛔ ABORT")
             mc.btn_takeoff_hold.setStyleSheet(
@@ -704,6 +780,7 @@ class GCSApp(MainWindow):
             except RuntimeError:
                 pass
             mc.btn_takeoff_hold.clicked.connect(self.flight_controller.abort)
+            mc.btn_manual_takeoff.setEnabled(False)
 
     def _on_mode_activated(self, mode_name: str):
         """
@@ -740,6 +817,19 @@ class GCSApp(MainWindow):
         else:
             color = "#F44336"   # đỏ — kém
         self.lbl_ping.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+        # Reset ping timeout — mỗi khi nhận PONG thành công, đặt lại đồng hồ 3s
+        self._ping_timeout_timer.start()
+
+    def _on_ping_timeout(self):
+        """
+        Slot: Quá 3 giây không nhận PONG mới → hiển thị Timeout trên ping label.
+
+        Điều này xảy ra khi WiFi yếu hoặc ESP32 mất tín hiệu nhưng socket
+        chưa bị đóng hoàn toàn (TCP keepalive chưa timeout).
+        """
+        self.lbl_ping.setText("🏓 Timeout")
+        self.lbl_ping.setStyleSheet("color: #F44336; font-weight: bold;")
 
     def _on_command_acked(self, ack_type: str):
         """
